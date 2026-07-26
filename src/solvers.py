@@ -39,6 +39,17 @@ def energy_table(Q: np.ndarray) -> np.ndarray:
     return np.einsum("bi,ij,bj->b", bits, Q, bits, optimize=True)
 
 
+def _flip_delta(Q: np.ndarray, qx: np.ndarray, x: np.ndarray,
+                i: int) -> float:
+    """Energy delta of flipping bit i: (1-2x_i) * (Q_ii*(1-2x_i) + 2*(Qx)_i).
+
+    ``qx`` must be the current Q @ x. Extracted from solve_sa so the
+    incremental update can be unit-tested against full re-evaluation.
+    """
+    d = 1.0 - 2.0 * x[i]
+    return d * (Q[i, i] * d + 2.0 * qx[i])
+
+
 def solve_exact(Q: np.ndarray) -> tuple[np.ndarray, float]:
     """Exhaustive exact optimum. Returns (x_best, energy_best);
     x_best[i] = (argmin index >> i) & 1."""
@@ -88,9 +99,7 @@ def solve_sa(Q: np.ndarray, budget_s: float, seed: int = 42,
             T = T_init * np.exp(log_ratio * step / max(steps_per_chain - 1, 1))
             i = int(rng.integers(n))
             xi = x[i]
-            # delta of flipping bit i: (1-2x_i) * (Q_ii*(1-2x_i) + 2*(Qx)_i)
-            delta = (1.0 - 2.0 * xi) * (Q[i, i] * (1.0 - 2.0 * xi)
-                                        + 2.0 * qx[i])
+            delta = _flip_delta(Q, qx, x, i)
             if delta <= 0.0 or rng.random() < np.exp(-delta / T):
                 x[i] = 1.0 - xi
                 qx += (1.0 - 2.0 * xi) * Q[:, i]

@@ -96,6 +96,30 @@ def main():
     print(f"[4/4] SA with matched budget ({t_qaoa:.1f}s)")
     x_sa, e_sa = solve_sa(Q, budget_s=t_qaoa, seed=SA_SEED)
 
+    # --- feasible-subspace landscape disclosure ---------------------------
+    # E_worst spans all 2^16 states, but the cardinality penalty A*(sum-K)^2
+    # dominates the landscape: any feasible (K=8) state sits within a tiny
+    # energy band near the optimum, so the worst-anchored ratio of even a
+    # random feasible solution is ~1. Quantify that here so the report does
+    # not overstate what the 0.95 acceptance actually discriminates.
+    n_assets = len(CODES)
+    m = np.arange(2**n_assets, dtype=np.int64)
+    popcount = np.zeros_like(m)
+    for b in range(n_assets):
+        popcount += (m >> b) & 1
+    feas_e = e_table[popcount == K]
+    feas_min, feas_max = float(feas_e.min()), float(feas_e.max())
+    feas_spread = feas_max - feas_min
+    full_span = e_worst - e_exact
+    rng_feas = np.random.default_rng(0)
+    feas_sample = rng_feas.choice(feas_e, size=min(2048, len(feas_e)),
+                                  replace=False)
+    r_feas_random = float(np.mean((feas_sample - e_worst) / -full_span))
+    print(f"feasible subspace (K={K}): {len(feas_e)} states, "
+          f"energy spread {feas_spread:.6f} "
+          f"({100.0 * feas_spread / full_span:.2f}% of full span), "
+          f"random-feasible mean ratio {r_feas_random:.4f}")
+
     def ratio(e):
         return (e - e_worst) / (e_exact - e_worst)
 
@@ -140,6 +164,27 @@ energies x'Qx. 1.0 = exact optimum, 0.0 = worst of the 2^16 states.
 
 E_worst = {e_worst:.8f}; degenerate exact optima: {n_optimal}
 
+## Feasible-subspace landscape (penalty-dominated caveat)
+
+E_worst above is the max over **all** 2^16 states, including
+cardinality-violating ones. The penalty A*(sum x - K)^2 (A={A}) dominates
+the landscape, so anchoring the ratio at E_worst compresses every
+near-feasible solution against 1.0:
+
+- (a) Feasible subspace (popcount(x) = K = {K}): {len(feas_e)} states,
+  energies in [{feas_min:.8f}, {feas_max:.8f}], spread
+  {feas_spread:.6f} — only {100.0 * feas_spread / full_span:.2f}% of the
+  full E_exact..E_worst span ({full_span:.6f}).
+- (b) Random-feasible baseline: mean worst-anchored ratio of
+  {len(feas_sample)} uniformly sampled K={K} solutions =
+  **{r_feas_random:.4f}** (seed 0). I.e. doing nothing but respecting the
+  cardinality constraint already nearly saturates the metric.
+- (c) Consequence: the ratio >= {RATIO_THRESHOLD} acceptance on this
+  instance validates **encoding correctness** (QUBO build, Ising mapping,
+  energy bookkeeping) but has **limited discriminative power for QAOA
+  optimization ability** — the threshold is close to vacuous for any
+  feasible output.
+
 Selected by exact: {[c for c, b in zip(CODES, x_exact) if b]}
 Selected by QAOA:  {[c for c, b in zip(CODES, x_qaoa.astype(int)) if b]}
 Selected by SA:    {[c for c, b in zip(CODES, x_sa) if b]}
@@ -158,6 +203,11 @@ seed={QAOA_SEED}, device=cpu, restarts=3 (IsingQAOA internal default)
 QAOA approximation ratio = **{r_qaoa:.4f}** vs threshold {RATIO_THRESHOLD}
 -> **{"PASS" if passed else "FAIL"}** (design doc section 8 acceptance).
 SA on the same wall-clock budget: ratio {r_sa:.4f}.
+
+Caveat (see landscape section above): this PASS attests to encoding
+correctness, not to strong QAOA optimization power — a uniform random
+feasible K={K} solution already scores ratio ~{r_feas_random:.4f} under
+this worst-anchored metric.
 """
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_PATH.write_text(report, encoding="utf-8")

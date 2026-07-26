@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from solvers import solve_exact, solve_sa
+from solvers import solve_exact, solve_sa, _flip_delta
 
 
 def random_q(n, seed):
@@ -81,3 +81,28 @@ def test_solve_sa_respects_budget():
     solve_sa(Q, budget_s=0.3, seed=1)
     elapsed = time.perf_counter() - t0
     assert elapsed < 2.0  # generous upper bound; must not run away
+
+
+# ---------------------------------------------------------------------------
+# _flip_delta (incremental SA energy update)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("n, seed", [(8, 20), (10, 21), (12, 22)])
+def test_flip_delta_matches_full_reevaluation(n, seed):
+    """200 random single-bit flips: after each incremental update via
+    _flip_delta (and the solve_sa qx update rule), the running energy and
+    qx must match a full re-evaluation x'Qx / Q@x to ~1e-10."""
+    Q = random_q(n, seed)
+    rng = np.random.default_rng(seed + 1000)
+    x = rng.integers(0, 2, size=n).astype(np.float64)
+    qx = x @ Q
+    e = float(x @ qx)
+    for _ in range(200):
+        i = int(rng.integers(n))
+        xi = x[i]
+        delta = _flip_delta(Q, qx, x, i)
+        # same update rule as solve_sa
+        x[i] = 1.0 - xi
+        qx += (1.0 - 2.0 * xi) * Q[:, i]
+        e += delta
+        np.testing.assert_allclose(qx, x @ Q, atol=1e-10)
+        assert e == pytest.approx(float(x @ Q @ x), abs=1e-10)
