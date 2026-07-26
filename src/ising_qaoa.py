@@ -301,13 +301,14 @@ class IsingQAOA(QAOAAlgorithm):
             n_qubits, layers, device, optimizer.
         """
         h, J, n = self._validate(h, J, optimizer)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
         rng = np.random.default_rng(seed)
 
-        self.log(f"Stage 1: Building Ising Hamiltonian (n={n})")
-        h_cost = self._get_h_cost(h, J)
-        exact_energy = float(np.linalg.eigvalsh(h_cost)[0])
+        self.log(f"Stage 1: Computing exact ground-state energy (n={n})")
+        # H is strictly diagonal in the computational basis, so the exact
+        # ground-state energy is simply min over the energy vector; this
+        # avoids the dense (2^n, 2^n) eigvalsh which OOMs at n=16.
+        e_vec = self._energy_vector(h, J)
+        exact_energy = float(e_vec.min())
 
         self.log(f"Stage 2: Variational optimization "
                  f"({optimizer}, layers={layers}, max_iter={max_iter})")

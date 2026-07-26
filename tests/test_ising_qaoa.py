@@ -101,6 +101,19 @@ def test_exact_energy_matches_brute_force(algo):
     assert res["exact_energy"] == pytest.approx(brute, abs=1e-9)
 
 
+def test_exact_energy_min_matches_eigvalsh_n8(algo):
+    """n=8: e_vec.min() (used by solve) must equal dense eigvalsh ground state.
+
+    solve() computes exact_energy as min of the energy vector (H is strictly
+    diagonal); this test pins that against the old dense-eigvalsh result.
+    """
+    h, J = make_instance(8, seed=12)
+    e_vec = algo._energy_vector(h, J)
+    h_cost = algo._get_h_cost(h, J)
+    dense_ground = float(np.linalg.eigvalsh(h_cost)[0])
+    assert float(e_vec.min()) == pytest.approx(dense_ground, abs=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # 3. Convergence: n=6, layers=4 approximation ratio >= 0.9
 # ---------------------------------------------------------------------------
