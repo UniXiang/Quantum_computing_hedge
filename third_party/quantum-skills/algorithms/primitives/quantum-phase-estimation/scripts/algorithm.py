@@ -1,0 +1,61 @@
+"""Quantum Phase Estimation (QPE) — estimate eigenphase of a unitary operator."""
+
+import numpy as np
+from unitarylab_algorithms import QPEAlgorithm
+from unitarylab.core import Circuit
+
+
+def example_s_gate():
+    """Estimate phase of S gate eigenstate |1>.  Expected phi = 0.25."""
+    U = Circuit(1, name="S_gate")
+    U.s(0)
+
+    prepare_target = Circuit(1, name="prep_1")
+    prepare_target.x(0)
+
+    algo = QPEAlgorithm()
+    result = algo.run(
+        U=U,
+        d=4,
+        prepare_target=prepare_target,
+        backend="torch",
+    )
+
+    print("=" * 50)
+    print("QPE Example: S Gate  (expected phi = 0.25)")
+    print("=" * 50)
+    for f in result.get("plot", []):
+        print(f"  Saved file      : {f['filename']} ({f['format']})")
+    print(f"  Estimated phase : {result['Estimated phase']}")
+    print(f"  Best probability: {result['Best phase probability']:.4f}")
+    print(f"  Circuit path    : {result.get('circuit_path')}")
+
+
+def example_t_gate():
+    """Estimate phase of T gate eigenstate |1>.  Expected phi = 0.125."""
+    U = Circuit(1, name="T_gate")
+    U.p(np.pi / 4, 0)
+
+    prepare_target = Circuit(1, name="prep_1")
+    prepare_target.x(0)
+
+    algo = QPEAlgorithm()
+    result = algo.run(
+        U=U,
+        d=5,
+        prepare_target=prepare_target,
+        backend="torch",
+    )
+
+    print("=" * 50)
+    print("QPE Example: T Gate  (expected phi = 0.125)")
+    print("=" * 50)
+    for f in result.get("plot", []):
+        print(f"  Saved file      : {f['filename']} ({f['format']})")
+    print(f"  Estimated phase : {result['Estimated phase']}")
+    print(f"  Best probability: {result['Best phase probability']:.4f}")
+
+
+if __name__ == "__main__":
+    example_s_gate()
+    example_t_gate()
