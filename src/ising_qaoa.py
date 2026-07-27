@@ -58,6 +58,7 @@ import time
 import numpy as np
 import torch
 from scipy.optimize import minimize
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from unitarylab import Circuit
 from unitarylab_algorithms.quantum_machine_learning.qaoa.algorithm import QAOAAlgorithm
@@ -67,6 +68,95 @@ TOP_K = 16
 # Internal random restarts for the autograd path (best expectation kept).
 # All restarts draw from the same seeded RNG, so results stay reproducible.
 N_RESTARTS = 3
+
+# dtype switch: name -> (complex state dtype, real dtype for params/e_vec).
+# complex64 keeps e_vec/params in float32: Ising energies are O(n * max|J|)
+# (~1e2 at n=28), so float32's relative eps 1.2e-7 gives absolute energy
+# error ~1e-5 — far below the 1e-3 CPU/GPU consistency threshold the Biren
+# spike handbook recommends for complex64; the statevector phases are the
+# precision-critical part and halving them halves the dominant memory term.
+_PRECISION = {
+    "complex128": (torch.complex128, torch.float64),
+    "complex64": (torch.complex64, torch.float32),
+}
+
+# unitarylab's compiled executor names the Biren SUPA device 'gpu' (see
+# GPU使用对接.md §3); torch_br tensors themselves live on device 'supa'.
+_UNITARYLAB_DEVICE = {"biren": "gpu", "supa": "gpu"}
+
+
+def resolve_device(device_str) -> torch.device:
+    """Resolve a user device string to a torch.device.
+
+    'cpu' / 'cuda[:i]' pass straight through to ``torch.device``.
+    'biren' (or 'supa') targets the Biren SUPA stack: it requires
+    ``torch_br`` (only installed in the Biren container) and resolves to
+    ``torch.device('supa')`` — the device torch_br tensors are created on
+    (GPU使用对接.md §3/§8). Raises ImportError with an actionable message
+    when torch_br is unavailable, so local (non-Biren) runs fail clearly
+    at the call site instead of deep inside tensor allocation.
+    """
+    if isinstance(device_str, torch.device):
+        device_str = str(device_str)
+    name = str(device_str).lower()
+    if name in ("biren", "supa") or name.startswith("supa:"):
+        try:
+            import torch_br  # noqa: F401  (registers the 'supa' backend)
+        except ImportError as exc:
+            raise ImportError(
+                f"device '{device_str}' requires the Biren SUPA torch "
+                "backend (import torch_br), which is only installed in the "
+                "Biren container (source brsw_set_env.sh first, see "
+                "GPU使用对接.md §3); run on the Biren host or use "
+                "device='cpu'/'cuda' locally") from exc
+        return torch.device("supa" if name == "biren" else name)
+    return torch.device(device_str)
+
+
+def estimate_evolve_memory(n: int, layers: int, dtype: str = "complex128",
+                           checkpoint: bool = False) -> dict:
+    """Analytic peak-memory model for one _train_autograd fwd+bwd step.
+
+    Model (dim d = 2^n, c = bytes/complex entry, r = bytes/real entry):
+      - e_vec:                     d * r              (persistent input)
+      - per-layer retained activations, no checkpoint:
+          mixer per qubit: movedim().reshape(2,-1) copies (non-contiguous
+            view) and each matmul output is saved for backward
+            -> 2 complex buffers per qubit per layer  = 2n * d * c
+          cost: product buffer d * r + phase d * c + layer-input psi d * c
+          => per layer (2n + 2) * d * c + d * r, times p layers
+      - checkpoint=True: only the p+1 layer-boundary states are retained
+          ((p+1) * d * c); during backward each layer's activations are
+          recomputed and freed one layer at a time, adding at most one
+          layer's worth: (2n + 2) * d * c + d * r
+      - backward grad of the live statevector: d * c
+    Numbers are retained-activation estimates (no allocator/fragmentation
+    overhead); the acceptance margin absorbs that.
+    """
+    if dtype not in _PRECISION:
+        raise ValueError(f"unknown dtype '{dtype}', "
+                         f"expected one of {sorted(_PRECISION)}")
+    cbytes = 16 if dtype == "complex128" else 8
+    rbytes = cbytes // 2
+    d = 1 << n
+    state_bytes = d * cbytes
+    e_vec_bytes = d * rbytes
+    per_layer = (2 * n + 2) * state_bytes + e_vec_bytes
+    if checkpoint:
+        boundary_bytes = (layers + 1) * state_bytes
+        activation_bytes = per_layer  # one layer recomputed at a time
+    else:
+        boundary_bytes = 0
+        activation_bytes = layers * per_layer
+    grad_bytes = state_bytes
+    total = e_vec_bytes + boundary_bytes + activation_bytes + grad_bytes
+    return {
+        "n": n, "layers": layers, "dtype": dtype, "checkpoint": checkpoint,
+        "state_bytes": state_bytes, "e_vec_bytes": e_vec_bytes,
+        "boundary_bytes": boundary_bytes,
+        "activation_bytes": activation_bytes,
+        "grad_bytes": grad_bytes, "total_bytes": total,
+    }
 
 
 def ising_energy(bitstring: str, h: np.ndarray, J: np.ndarray) -> float:
@@ -186,7 +276,9 @@ class IsingQAOA(QAOAAlgorithm):
     # Torch-native differentiable evolution (autograd training path)
     # ------------------------------------------------------------------
     def _evolve_torch(self, params, h: np.ndarray, J: np.ndarray,
-                      device: str = "cpu", e_vec=None) -> torch.Tensor:
+                      device: str = "cpu", e_vec=None,
+                      dtype: torch.dtype = torch.complex128,
+                      checkpoint: bool = False) -> torch.Tensor:
         """Statevector after the QAOA circuit, as a torch tensor.
 
         Applies exactly the same unitary as ``_build_circuit``:
@@ -201,18 +293,31 @@ class IsingQAOA(QAOAAlgorithm):
             (default) recomputes it from (h, J) — kept as the default so
             existing standalone callers/tests keep working without
             signature changes.
-        Returns a complex128 tensor of shape (2^n,) on ``device``.
+        ``dtype``: torch.complex128 (default, pre-T3.2 behavior) or
+            torch.complex64; params/e_vec are cast to the matching real
+            dtype (float64/float32 — see _PRECISION for the float32
+            precision justification).
+        ``checkpoint``: if True, wrap each QAOA layer (cost + mixer) in
+            ``torch.utils.checkpoint`` (use_reentrant=False) so only the
+            layer-boundary states are retained and each layer's forward
+            is recomputed during backward; the trajectory is unchanged
+            (recompute is deterministic). Only active when params
+            requires grad — inference calls run the plain forward.
+        Returns a complex tensor of ``dtype`` and shape (2^n,) on
+        ``device``.
         """
+        cdtype = dtype
+        rdtype = torch.float64 if cdtype == torch.complex128 else torch.float32
         n = len(h)
         p = len(params) // 2
         if not isinstance(params, torch.Tensor):
             params = torch.as_tensor(np.asarray(params, dtype=np.float64))
-        params = params.to(device=device, dtype=torch.float64)
+        params = params.to(device=device, dtype=rdtype)
         gammas, betas = params[:p], params[p:]
 
         if e_vec is None:
             e_vec = self._energy_vector(h, J)
-        e_vec = torch.as_tensor(e_vec, dtype=torch.float64, device=device)
+        e_vec = torch.as_tensor(e_vec, dtype=rdtype, device=device)
         dim = 2**n
         n_axes = tuple(range(n - 1, -1, -1))
 
@@ -224,27 +329,42 @@ class IsingQAOA(QAOAAlgorithm):
         def to_flat(t):
             return t.permute(n_axes).reshape(dim)
 
-        # |+>^n
-        psi = torch.full((dim,), 2.0 ** (-n / 2),
-                         dtype=torch.complex128, device=device)
-
-        for layer in range(p):
-            # cost layer: diagonal phase exp(-i * gamma * E(z))
-            psi = psi * torch.exp(-1j * gammas[layer] * e_vec)
+        def layer_fn(psi_in, g, b):
+            # cost layer: diagonal phase exp(-i * gamma * E(z)), built in
+            # the working precision (torch.complex of real-dtype parts)
+            ang = g * e_vec
+            phase = torch.complex(torch.cos(ang), -torch.sin(ang))
+            t = to_axes(psi_in * phase)
             # mixer layer: RX(2*beta) on every qubit
-            theta = 2.0 * betas[layer]
+            theta = 2.0 * b
             c = torch.cos(theta / 2.0)
             s = torch.sin(theta / 2.0)
-            rx = torch.stack([
-                torch.stack([c, -1j * s]),
-                torch.stack([-1j * s, c]),
-            ]).to(torch.complex128)
-            t = to_axes(psi)
+            zero = torch.zeros_like(c)
+            rx = torch.complex(
+                torch.stack([torch.stack([c, zero]),
+                             torch.stack([zero, c])]),
+                torch.stack([torch.stack([zero, -s]),
+                             torch.stack([-s, zero])]),
+            )
             for k in range(n):
                 t = torch.movedim(t, k, 0).reshape(2, -1)
                 t = (rx @ t).reshape((2,) * n)
                 t = torch.movedim(t, 0, k)
-            psi = to_flat(t)
+            return to_flat(t)
+
+        # |+>^n
+        psi = torch.full((dim,), 2.0 ** (-n / 2),
+                         dtype=cdtype, device=device)
+        # Checkpointing only matters when building a graph; recomputing a
+        # grad-free forward would just waste time.
+        use_ckpt = (checkpoint and torch.is_grad_enabled()
+                    and params.requires_grad)
+        for layer in range(p):
+            if use_ckpt:
+                psi = _torch_checkpoint(layer_fn, psi, gammas[layer],
+                                        betas[layer], use_reentrant=False)
+            else:
+                psi = layer_fn(psi, gammas[layer], betas[layer])
         return psi
 
     # ------------------------------------------------------------------
@@ -275,7 +395,9 @@ class IsingQAOA(QAOAAlgorithm):
         return h, J, n
 
     def _train_autograd(self, initial_params, h, J, layers, device,
-                        max_iter, energy_history, e_vec=None):
+                        max_iter, energy_history, e_vec=None,
+                        dtype: torch.dtype = torch.complex128,
+                        checkpoint: bool = False):
         """Adam on the torch-native evolution; returns BEST-SEEN params.
 
         Tracks the lowest expectation energy over the whole trajectory
@@ -286,11 +408,31 @@ class IsingQAOA(QAOAAlgorithm):
         ``device`` (pass the same tensor across calls so the training loop
         does zero numpy->torch transfers and zero recomputation). ``None``
         recomputes it once here (compat path for standalone callers).
+        ``dtype``/``checkpoint``: forwarded to ``_evolve_torch``.
+
+        Memory model for one fwd+bwd step (d = 2^n, c = bytes per complex
+        entry of ``dtype``, r = c/2; same model as estimate_evolve_memory):
+          - persistent: e_vec d*r, params/Adam state O(p)
+          - checkpoint=False: every layer retains its full graph —
+            mixer 2 complex buffers per qubit (movedim-reshape copy +
+            matmul output saved for backward) + cost (phase d*c, product
+            d*r, layer-input psi d*c) -> p * ((2n+2)*d*c + d*r)
+          - checkpoint=True: only p+1 layer-boundary states retained
+            ((p+1)*d*c); each layer's activations are recomputed one layer
+            at a time during backward -> peak add (2n+2)*d*c + d*r
+          - backward grad of the live state: d*c
+        Anchor numbers (n=24, p=4, d*c complex128 = 268MB / complex64 =
+        134MB): complex128 no-ckpt ~54.6GB (exceeds the 32GB Biren106M —
+        this was final-review landmine #2); complex64 + ckpt ~7.7GB
+        (boundaries 0.67GB + one-layer recompute 6.78GB + e_vec 0.06GB +
+        grad 0.13GB) < 8GB acceptance target.
         """
+        cdtype = dtype
+        rdtype = torch.float64 if cdtype == torch.complex128 else torch.float32
         if e_vec is None:
             e_vec = torch.as_tensor(self._energy_vector(h, J),
-                                    dtype=torch.float64, device=device)
-        params = torch.as_tensor(initial_params, dtype=torch.float64,
+                                    dtype=rdtype, device=device)
+        params = torch.as_tensor(initial_params, dtype=rdtype,
                                  device=device).clone().requires_grad_(True)
         opt = torch.optim.Adam([params], lr=0.05)
         best_energy = np.inf
@@ -298,7 +440,8 @@ class IsingQAOA(QAOAAlgorithm):
         for _ in range(max_iter):
             opt.zero_grad()
             psi = self._evolve_torch(params, h, J, device=device,
-                                     e_vec=e_vec)
+                                     e_vec=e_vec, dtype=cdtype,
+                                     checkpoint=checkpoint)
             probs = psi.real**2 + psi.imag**2
             energy = torch.sum(probs * e_vec)
             energy.backward()
@@ -358,16 +501,20 @@ class IsingQAOA(QAOAAlgorithm):
     def solve(self, h: np.ndarray, J: np.ndarray, layers: int = 4,
               device: str = "cpu", optimizer: str = "autograd",
               max_iter: int = 200, seed: int = 42,
-              init: str = "random") -> dict:
+              init: str = "random", dtype: str = "complex128",
+              checkpoint: bool = False) -> dict:
         """Solve a weighted Ising model with QAOA.
 
         Parameters:
             h: (n,) local field coefficients
             J: (n,n) symmetric coupling matrix with zero diagonal
             layers: QAOA depth p
-            device: 'cpu' or torch device string (e.g. 'cuda:0'); passed
-                through to torch tensors and to qc.execute(backend='torch',
-                device=device) on the cobyla path
+            device: 'cpu', a torch device string (e.g. 'cuda:0'), or
+                'biren'/'supa' for the Biren SUPA stack (resolved via
+                resolve_device; requires torch_br, only present in the
+                Biren container). Torch tensors go to the resolved device;
+                unitarylab circuit executions (cobyla path and Stage 3)
+                map biren/supa -> 'gpu'.
             optimizer: 'autograd' (Adam, torch backprop through the
                 circuit) or 'cobyla' (scipy COBYLA cross-check path)
             max_iter: optimizer iterations per trained level
@@ -378,6 +525,21 @@ class IsingQAOA(QAOAAlgorithm):
                 warm-started from the previous level's best parameters via
                 _interp_extend; the p=1 level uses the same seeded restarts
                 as 'random')
+            dtype: 'complex128' (default, pre-T3.2 behavior) or
+                'complex64' for the autograd training path. In complex64
+                the statevector/evolution run in complex64 while e_vec and
+                parameters use float32 (justification in _PRECISION:
+                energies are O(n*max|J|) ~ 1e2, so float32's 1.2e-7
+                relative eps is ~1e-5 absolute — far below the 1e-3
+                cross-device consistency threshold). Stage 3 final
+                measurement always re-runs in complex128 via the
+                unitarylab circuit, so reported probabilities/bitstrings
+                keep the float64 bit-exact anchor; dtype only affects the
+                training trajectory.
+            checkpoint: if True, per-layer gradient checkpointing on the
+                autograd path (see _train_autograd docstring memory
+                model); trajectory-identical, trades one extra forward
+                recompute per layer for the activation memory.
 
         Returns:
             dict with keys: bitstrings (top-K bitstring -> probability),
@@ -386,12 +548,19 @@ class IsingQAOA(QAOAAlgorithm):
             energy; H is strictly diagonal so this is min of the energy
             vector, no dense diagonalization), energy_history (all
             restarts and, for init='interp', all levels concatenated in
-            training order), n_qubits, layers, device, optimizer.
+            training order), n_qubits, layers, device, optimizer, dtype,
+            checkpoint.
         """
         h, J, n = self._validate(h, J, optimizer)
         if init not in ("random", "interp"):
             raise ValueError(f"unknown init '{init}', "
                              "expected 'random' or 'interp'")
+        if dtype not in _PRECISION:
+            raise ValueError(f"unknown dtype '{dtype}', "
+                             f"expected one of {sorted(_PRECISION)}")
+        cdtype, rdtype = _PRECISION[dtype]
+        tdevice = resolve_device(device)
+        udevice = _UNITARYLAB_DEVICE.get(str(device).lower(), device)
         rng = np.random.default_rng(seed)
 
         self.log(f"Stage 1: Computing exact ground-state energy (n={n})")
@@ -404,22 +573,23 @@ class IsingQAOA(QAOAAlgorithm):
         exact_energy = float(e_vec.min())
         # Torch copy moved to the training device once; the training loop
         # itself does zero numpy->torch transfers and zero recomputation.
-        e_vec_t = (torch.as_tensor(e_vec, dtype=torch.float64, device=device)
+        e_vec_t = (torch.as_tensor(e_vec, dtype=rdtype, device=tdevice)
                    if optimizer == "autograd" else None)
 
         self.log(f"Stage 2: Variational optimization "
                  f"({optimizer}, layers={layers}, max_iter={max_iter}, "
-                 f"init={init})")
+                 f"init={init}, dtype={dtype}, checkpoint={checkpoint})")
         energy_history: list = []
         q_start = time.time()
 
         def train_level(initial_params, level):
             if optimizer == "autograd":
                 return self._train_autograd(
-                    initial_params, h, J, level, device, max_iter,
-                    energy_history, e_vec=e_vec_t)
+                    initial_params, h, J, level, tdevice, max_iter,
+                    energy_history, e_vec=e_vec_t, dtype=cdtype,
+                    checkpoint=checkpoint)
             params = self._train_cobyla(
-                initial_params, h, J, level, device, max_iter,
+                initial_params, h, J, level, udevice, max_iter,
                 energy_history, e_vec=e_vec)
             return params, energy_history[-1]
 
@@ -459,9 +629,10 @@ class IsingQAOA(QAOAAlgorithm):
                  f"final expectation: {final_exp:.6f}")
 
         self.log("Stage 3: Final state measurement and bitstring decoding")
-        # Final state via the unitarylab circuit (bit-exact convention anchor).
+        # Final state via the unitarylab circuit (bit-exact convention
+        # anchor; always complex128 regardless of the training dtype).
         qc_final = self._build_circuit(final_params, h, J)
-        psi_out = qc_final.execute(backend="torch", device=device).state
+        psi_out = qc_final.execute(backend="torch", device=udevice).state
         psi = np.asarray(psi_out, dtype=np.complex128).flatten()
         probs = np.abs(psi) ** 2
         probs = probs / probs.sum()
@@ -489,4 +660,6 @@ class IsingQAOA(QAOAAlgorithm):
             "layers": layers,
             "device": device,
             "optimizer": optimizer,
+            "dtype": dtype,
+            "checkpoint": checkpoint,
         }

@@ -42,13 +42,14 @@ def algo(tmp_path):
 
 
 @pytest.mark.parametrize("n, K", [(8, 4), (10, 5)])
-def test_full_chain_bitstring_to_qubo_energy(algo, n, K):
+@pytest.mark.parametrize("dtype", ["complex128", "complex64"])
+def test_full_chain_bitstring_to_qubo_energy(algo, n, K, dtype):
     returns = make_returns(n)
     Q = build_qubo(returns, K=K, lam=0.05, A=0.01, gamma=0.0, x_prev=None)
     h, J, offset = qubo_to_ising(Q)
 
     res = algo.solve(h, J, layers=2, device="cpu", optimizer="autograd",
-                     max_iter=60, seed=42)
+                     max_iter=60, seed=42, dtype=dtype)
 
     # bitstring convention: s[i] = x_i (qubit i, LSB-first state index)
     x = np.array([int(b) for b in res["best_bitstring"]], dtype=np.float64)
