@@ -191,3 +191,131 @@ def test_invalid_inputs_raise(algo):
     with pytest.raises(ValueError):
         J_bad = np.zeros((4, 4)); J_bad[0, 1] = 1.0  # not symmetric
         algo.solve(h, J_bad)
+    with pytest.raises(ValueError):
+        algo.solve(h, J, init="not-an-init")
+
+
+# ---------------------------------------------------------------------------
+# 7. Chunked energy vector: must match the dense reference at any chunk size
+# ---------------------------------------------------------------------------
+def energy_vector_reference(h, J):
+    """Pre-refactor dense algorithm (spin table + pair matrix), n small only."""
+    n = len(h)
+    idx = np.arange(2**n)
+    bits = (idx[:, None] >> np.arange(n)[None, :]) & 1
+    z = 1.0 - 2.0 * bits.astype(np.float64)
+    e = z @ h
+    iu = np.triu_indices(n, k=1)
+    return e + (z[:, iu[0]] * z[:, iu[1]]) @ J[iu]
+
+
+@pytest.mark.parametrize("n, seed", [(4, 70), (6, 71), (8, 72)])
+@pytest.mark.parametrize("chunk_size", [1, 3, 2**4, None])
+def test_energy_vector_chunked_matches_reference(algo, n, seed, chunk_size):
+    h, J = make_instance(n, seed)
+    if chunk_size is None:
+        e = algo._energy_vector(h, J)
+    else:
+        e = algo._energy_vector(h, J, chunk_size=chunk_size)
+    np.testing.assert_allclose(e, energy_vector_reference(h, J), atol=1e-12)
+
+
+def test_energy_vector_no_dense_spin_table(algo):
+    """Chunked path must not materialize the (2^n, n) spin table.
+
+    Proxy assertion: with chunk_size < 2^n the peak row-block buffer is
+    chunk_size rows, so the call must succeed even when 2^n rows of spins
+    would be huge — verified functionally by an absurdly small chunk size
+    at n=14 (dense table would be 2^14*14*8 = 1.8MB, fine either way; the
+    real memory guarantee is benchmarked in src/bench_n16.py).
+    """
+    h, J = make_instance(14, seed=73)
+    e = algo._energy_vector(h, J, chunk_size=97)
+    np.testing.assert_allclose(e, energy_vector_reference(h, J), atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# 8. _get_h_cost guard: dense matrix only for small-n test validation
+# ---------------------------------------------------------------------------
+def test_get_h_cost_guard_large_n(algo):
+    h, J = make_instance(13, seed=74)
+    with pytest.raises(ValueError, match="dense"):
+        algo._get_h_cost(h, J)
+
+
+def test_get_h_cost_guard_boundary(algo):
+    h, J = make_instance(12, seed=75)
+    h_cost = algo._get_h_cost(h, J)  # n=12 must still work
+    assert h_cost.shape == (2**12, 2**12)
+
+
+# ---------------------------------------------------------------------------
+# 9. Base-class run() is not compatible with IsingQAOA semantics
+# ---------------------------------------------------------------------------
+def test_run_raises_not_implemented(algo):
+    with pytest.raises(NotImplementedError, match="solve"):
+        algo.run()
+
+
+# ---------------------------------------------------------------------------
+# 10. Best-seen parameter tracking in the autograd path
+# ---------------------------------------------------------------------------
+def test_train_autograd_returns_best_seen_params(algo):
+    import torch
+    h, J = make_instance(5, seed=76)
+    e_vec_np = algo._energy_vector(h, J)
+    e_vec_t = torch.as_tensor(e_vec_np, dtype=torch.float64)
+    history = []
+    init = np.random.default_rng(5).uniform(0.0, 0.5, size=6)
+    params, best_exp = algo._train_autograd(
+        init, h, J, layers=3, device="cpu", max_iter=60,
+        energy_history=history, e_vec=e_vec_t)
+    # returned energy must be the trajectory minimum, not the last iterate
+    assert best_exp == pytest.approx(min(history))
+    # and the returned params must actually realize that energy
+    psi = algo._evolve_torch(params, h, J, device="cpu", e_vec=e_vec_t)
+    probs = psi.real**2 + psi.imag**2
+    assert float(torch.sum(probs * e_vec_t)) == pytest.approx(best_exp)
+
+
+# ---------------------------------------------------------------------------
+# 11. INTERP initialization
+# ---------------------------------------------------------------------------
+def test_interp_extend_shape_and_values(algo):
+    # p=2 -> p=3: endpoints preserved, interior linearly interpolated
+    params = np.array([0.1, 0.5, 0.2, 0.4])  # gammas=[0.1,0.5], betas=[0.2,0.4]
+    out = algo._interp_extend(params)
+    assert out.shape == (6,)
+    # gamma_1' = g1, gamma_3' = g2, gamma_2' = 0.5*g1 + 0.5*g2
+    np.testing.assert_allclose(out[:3], [0.1, 0.3, 0.5], atol=1e-12)
+    np.testing.assert_allclose(out[3:], [0.2, 0.3, 0.4], atol=1e-12)
+
+
+def test_interp_extend_from_p1(algo):
+    params = np.array([0.7, 0.9])
+    out = algo._interp_extend(params)
+    assert out.shape == (4,)
+    # p=1 -> p=2 under Zhou et al. INTERP: gamma'_1 = gamma'_2 = gamma_1
+    np.testing.assert_allclose(out, [0.7, 0.7, 0.9, 0.9], atol=1e-12)
+
+
+@pytest.mark.parametrize("optimizer", ["autograd"])
+def test_solve_init_interp_reproducible(algo, optimizer):
+    h, J = make_instance(5, seed=77)
+    common = dict(layers=3, optimizer=optimizer, max_iter=40, seed=11)
+    r1 = algo.solve(h, J, init="interp", **common)
+    r2 = algo.solve(h, J, init="interp", **common)
+    assert r1["best_bitstring"] == r2["best_bitstring"]
+    assert r1["best_energy"] == pytest.approx(r2["best_energy"])
+    assert r1["energy_history"] == pytest.approx(r2["energy_history"])
+    # variational principle still holds
+    assert r1["best_energy"] >= r1["exact_energy"] - 1e-6
+
+
+def test_solve_init_random_unchanged(algo):
+    """init='random' (default) must reproduce the pre-INTERP trajectory."""
+    h, J = make_instance(5, seed=78)
+    r1 = algo.solve(h, J, layers=3, max_iter=40, seed=11)
+    r2 = algo.solve(h, J, layers=3, max_iter=40, seed=11, init="random")
+    assert r1["energy_history"] == pytest.approx(r2["energy_history"])
+    assert r1["best_bitstring"] == r2["best_bitstring"]

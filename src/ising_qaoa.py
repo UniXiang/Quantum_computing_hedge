@@ -99,33 +99,52 @@ class IsingQAOA(QAOAAlgorithm):
     # Hamiltonian construction
     # ------------------------------------------------------------------
     @staticmethod
-    def _spin_table(n: int) -> np.ndarray:
-        """(2^n, n) table of z values; row idx = basis state, qubit 0 = LSB
-        (unitarylab statevector ordering)."""
-        idx = np.arange(2**n)
-        shifts = np.arange(n)
-        bits = (idx[:, None] >> shifts[None, :]) & 1
-        return 1.0 - 2.0 * bits.astype(np.float64)
+    def _energy_vector(h: np.ndarray, J: np.ndarray,
+                       chunk_size: int | None = None) -> np.ndarray:
+        """E(z) for every computational basis state (diag of H_C).
 
-    @staticmethod
-    def _energy_vector(h: np.ndarray, J: np.ndarray) -> np.ndarray:
-        """E(z) for every computational basis state (diag of H_C)."""
+        Computed in row blocks of ``chunk_size`` (default 2^20) so no
+        (2^n, n) spin table and no (2^n, nnz) pair matrix is ever
+        materialized: inside a block the spin signs are generated directly
+        by bit shifts and the coupling term is evaluated as
+        0.5 * rowsum(z * (z @ J)) (J symmetric, zero diagonal, so
+        z'Jz = 2 * sum_{i<j} J_ij z_i z_j). Peak scratch memory is
+        O(chunk_size * n) — at the default chunk and n=28 that is ~700MB,
+        independent of 2^n.
+        """
         n = len(h)
-        z = IsingQAOA._spin_table(n)
-        e = z @ h
-        iu = np.triu_indices(n, k=1)
-        e = e + (z[:, iu[0]] * z[:, iu[1]]) @ J[iu]
+        dim = 1 << n
+        if chunk_size is None:
+            chunk_size = min(dim, 1 << 20)
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+        e = np.empty(dim, dtype=np.float64)
+        shifts = np.arange(n, dtype=np.int64)
+        for start in range(0, dim, chunk_size):
+            m = min(chunk_size, dim - start)
+            idx = start + np.arange(m, dtype=np.int64)
+            # (m, n) block of z values, qubit 0 = LSB (module convention)
+            z = 1.0 - 2.0 * ((idx[:, None] >> shifts[None, :]) & 1).astype(np.float64)
+            e[start:start + m] = z @ h + 0.5 * np.sum(z * (z @ J), axis=1)
         return e
 
     def _get_h_cost(self, h: np.ndarray, J: np.ndarray) -> np.ndarray:
-        """Weighted couplings sum_{i<j} J_ij Z_i Z_j + local fields sum_i h_i Z_i.
+        """Dense (diagonal) cost Hamiltonian — SMALL-n TEST VALIDATION ONLY.
 
-        Returns the dense (diagonal) cost Hamiltonian, same layout as the
-        base class: entry (idx, idx) is E(z) of basis state idx under the
-        module bitstring convention.
+        Entry (idx, idx) is E(z) of basis state idx under the module
+        bitstring convention. Raises for n > 12: the dense (2^n, 2^n)
+        complex matrix is ~1GB already at n=13 and 68GB at n=16; the
+        solve() path never needs it (H_C is diagonal — use
+        ``_energy_vector`` for its diagonal).
         """
         h = np.asarray(h, dtype=np.float64)
         J = np.asarray(J, dtype=np.float64)
+        if len(h) > 12:
+            raise ValueError(
+                f"_get_h_cost builds a dense (2^n, 2^n) matrix and is "
+                f"intended for small-n test validation only (n <= 12, got "
+                f"n={len(h)}); the solve path never needs the dense matrix. "
+                f"Use _energy_vector(h, J) for the diagonal of H_C.")
         e_vec = self._energy_vector(h, J)
         return np.diag(e_vec).astype(np.complex128)
 
@@ -167,7 +186,7 @@ class IsingQAOA(QAOAAlgorithm):
     # Torch-native differentiable evolution (autograd training path)
     # ------------------------------------------------------------------
     def _evolve_torch(self, params, h: np.ndarray, J: np.ndarray,
-                      device: str = "cpu") -> torch.Tensor:
+                      device: str = "cpu", e_vec=None) -> torch.Tensor:
         """Statevector after the QAOA circuit, as a torch tensor.
 
         Applies exactly the same unitary as ``_build_circuit``:
@@ -176,6 +195,12 @@ class IsingQAOA(QAOAAlgorithm):
         Differentiable w.r.t. ``params`` if it requires grad.
 
         ``params``: array-like of length 2*layers (numpy or torch tensor).
+        ``e_vec``: precomputed energy vector (numpy array or torch tensor).
+            Pass the same tensor every call to avoid recomputation and
+            numpy->torch transfers inside a training loop. ``None``
+            (default) recomputes it from (h, J) — kept as the default so
+            existing standalone callers/tests keep working without
+            signature changes.
         Returns a complex128 tensor of shape (2^n,) on ``device``.
         """
         n = len(h)
@@ -185,8 +210,9 @@ class IsingQAOA(QAOAAlgorithm):
         params = params.to(device=device, dtype=torch.float64)
         gammas, betas = params[:p], params[p:]
 
-        e_vec = torch.as_tensor(self._energy_vector(h, J),
-                                dtype=torch.float64, device=device)
+        if e_vec is None:
+            e_vec = self._energy_vector(h, J)
+        e_vec = torch.as_tensor(e_vec, dtype=torch.float64, device=device)
         dim = 2**n
         n_axes = tuple(range(n - 1, -1, -1))
 
@@ -224,6 +250,12 @@ class IsingQAOA(QAOAAlgorithm):
     # ------------------------------------------------------------------
     # Solver
     # ------------------------------------------------------------------
+    def run(self, *args, **kwargs):
+        """The base-class MaxCut run(edges, n) interface is not supported."""
+        raise NotImplementedError(
+            "IsingQAOA does not support the MaxCut-oriented base-class "
+            "run(edges, n) interface; use solve(h, J, ...) instead.")
+
     @staticmethod
     def _validate(h, J, optimizer):
         h = np.asarray(h, dtype=np.float64)
@@ -243,25 +275,51 @@ class IsingQAOA(QAOAAlgorithm):
         return h, J, n
 
     def _train_autograd(self, initial_params, h, J, layers, device,
-                        max_iter, energy_history):
+                        max_iter, energy_history, e_vec=None):
+        """Adam on the torch-native evolution; returns BEST-SEEN params.
+
+        Tracks the lowest expectation energy over the whole trajectory
+        (not the last iterate — Adam with a fixed lr does not converge
+        monotonically) and returns the parameters that realized it.
+
+        ``e_vec``: precomputed energy vector as a torch tensor on
+        ``device`` (pass the same tensor across calls so the training loop
+        does zero numpy->torch transfers and zero recomputation). ``None``
+        recomputes it once here (compat path for standalone callers).
+        """
+        if e_vec is None:
+            e_vec = torch.as_tensor(self._energy_vector(h, J),
+                                    dtype=torch.float64, device=device)
         params = torch.as_tensor(initial_params, dtype=torch.float64,
                                  device=device).clone().requires_grad_(True)
         opt = torch.optim.Adam([params], lr=0.05)
-        e_vec = torch.as_tensor(self._energy_vector(h, J),
-                                dtype=torch.float64, device=device)
+        best_energy = np.inf
+        best_params = None
         for _ in range(max_iter):
             opt.zero_grad()
-            psi = self._evolve_torch(params, h, J, device=device)
+            psi = self._evolve_torch(params, h, J, device=device,
+                                     e_vec=e_vec)
             probs = psi.real**2 + psi.imag**2
             energy = torch.sum(probs * e_vec)
             energy.backward()
+            # record BEFORE opt.step(): e_val is the energy at the current
+            # params, so the best-seen snapshot must be taken pre-step
+            e_val = float(energy.detach().cpu())
+            energy_history.append(e_val)
+            if e_val < best_energy:
+                best_energy = e_val
+                # clone: params is mutated in place by opt.step()
+                best_params = params.detach().clone()
             opt.step()
-            energy_history.append(float(energy.detach().cpu()))
-        return params.detach().cpu().numpy(), float(energy_history[-1])
+        if best_params is None:  # max_iter == 0 edge case
+            best_params = params.detach()
+            best_energy = np.inf
+        return best_params.cpu().numpy(), float(best_energy)
 
     def _train_cobyla(self, initial_params, h, J, layers, device,
-                      max_iter, energy_history):
-        e_vec = self._energy_vector(h, J)
+                      max_iter, energy_history, e_vec=None):
+        if e_vec is None:
+            e_vec = self._energy_vector(h, J)
 
         def obj_func(p_flat):
             qc = self._build_circuit(p_flat, h, J)
@@ -276,9 +334,31 @@ class IsingQAOA(QAOAAlgorithm):
                            options={"maxiter": max_iter})
         return np.asarray(opt_res.x, dtype=np.float64)
 
+    @staticmethod
+    def _interp_extend(params: np.ndarray) -> np.ndarray:
+        """INTERP heuristic (Zhou et al. 2020): extend p-layer optima to
+        (p+1)-layer initial values by linear interpolation.
+
+        For each of the gamma and beta halves, with the sequence extended
+        by zeros at both ends (v_0 = v_{p+1} = 0):
+
+            v'_i = w * v_{i-1} + (1 - w) * v_i,   w = (i-1)/p,  i = 1..p+1
+
+        (endpoints are preserved: v'_1 = v_1, v'_{p+1} = v_p).
+        """
+        params = np.asarray(params, dtype=np.float64)
+        p = len(params) // 2
+        out = np.empty(2 * (p + 1), dtype=np.float64)
+        w = np.arange(p + 1) / p  # w[i-1] for i = 1..p+1
+        for off, src in ((0, params[:p]), (p + 1, params[p:])):
+            ext = np.concatenate(([0.0], src, [0.0]))
+            out[off:off + p + 1] = w * ext[:-1] + (1.0 - w) * ext[1:]
+        return out
+
     def solve(self, h: np.ndarray, J: np.ndarray, layers: int = 4,
               device: str = "cpu", optimizer: str = "autograd",
-              max_iter: int = 200, seed: int = 42) -> dict:
+              max_iter: int = 200, seed: int = 42,
+              init: str = "random") -> dict:
         """Solve a weighted Ising model with QAOA.
 
         Parameters:
@@ -290,49 +370,90 @@ class IsingQAOA(QAOAAlgorithm):
                 device=device) on the cobyla path
             optimizer: 'autograd' (Adam, torch backprop through the
                 circuit) or 'cobyla' (scipy COBYLA cross-check path)
-            max_iter: optimizer iterations
+            max_iter: optimizer iterations per trained level
             seed: RNG seed for parameter initialization (fully reproducible)
+            init: 'random' (default; seeded uniform small-parameter inits
+                with N_RESTARTS restarts) or 'interp' (INTERP heuristic:
+                train p=1 first, then grow one layer at a time, each level
+                warm-started from the previous level's best parameters via
+                _interp_extend; the p=1 level uses the same seeded restarts
+                as 'random')
 
         Returns:
             dict with keys: bitstrings (top-K bitstring -> probability),
             best_bitstring (lowest-energy bitstring among the top-K most
-            probable outcomes), best_energy, exact_energy (dense
-            diagonalization ground-state energy), energy_history,
-            n_qubits, layers, device, optimizer.
+            probable outcomes), best_energy, exact_energy (ground-state
+            energy; H is strictly diagonal so this is min of the energy
+            vector, no dense diagonalization), energy_history (all
+            restarts and, for init='interp', all levels concatenated in
+            training order), n_qubits, layers, device, optimizer.
         """
         h, J, n = self._validate(h, J, optimizer)
+        if init not in ("random", "interp"):
+            raise ValueError(f"unknown init '{init}', "
+                             "expected 'random' or 'interp'")
         rng = np.random.default_rng(seed)
 
         self.log(f"Stage 1: Computing exact ground-state energy (n={n})")
         # H is strictly diagonal in the computational basis, so the exact
         # ground-state energy is simply min over the energy vector; this
         # avoids the dense (2^n, 2^n) eigvalsh which OOMs at n=16.
+        # The vector is computed ONCE here (chunked, bounded memory) and
+        # reused by every training call and by Stage 3 below.
         e_vec = self._energy_vector(h, J)
         exact_energy = float(e_vec.min())
+        # Torch copy moved to the training device once; the training loop
+        # itself does zero numpy->torch transfers and zero recomputation.
+        e_vec_t = (torch.as_tensor(e_vec, dtype=torch.float64, device=device)
+                   if optimizer == "autograd" else None)
 
         self.log(f"Stage 2: Variational optimization "
-                 f"({optimizer}, layers={layers}, max_iter={max_iter})")
+                 f"({optimizer}, layers={layers}, max_iter={max_iter}, "
+                 f"init={init})")
         energy_history: list = []
         q_start = time.time()
-        final_exp = None
-        if optimizer == "autograd":
+
+        def train_level(initial_params, level):
+            if optimizer == "autograd":
+                return self._train_autograd(
+                    initial_params, h, J, level, device, max_iter,
+                    energy_history, e_vec=e_vec_t)
+            params = self._train_cobyla(
+                initial_params, h, J, level, device, max_iter,
+                energy_history, e_vec=e_vec)
+            return params, energy_history[-1]
+
+        if init == "interp":
+            # p=1: same seeded restarts as the random path.
+            final_params, best_exp = None, np.inf
+            for _ in range(N_RESTARTS):
+                if optimizer == "autograd":
+                    init_p = rng.uniform(0.0, 0.5, size=2)
+                else:
+                    init_p = rng.uniform(0.0, np.pi, size=2)
+                params_r, exp_r = train_level(init_p, 1)
+                if exp_r < best_exp or final_params is None:
+                    best_exp, final_params = exp_r, params_r
+            # Grow one layer at a time, warm-started from INTERP-extended
+            # best parameters of the previous level.
+            for level in range(2, layers + 1):
+                init_p = self._interp_extend(final_params)
+                final_params, best_exp = train_level(init_p, level)
+            final_exp = best_exp
+        elif optimizer == "autograd":
             # Small-parameter inits avoid the poor plateaus of uniform(0, pi)
             # inits; a few seeded restarts, keep the best expectation.
             # Note: energy_history concatenates all restarts.
             final_params, best_exp = None, np.inf
             for _ in range(N_RESTARTS):
-                init = rng.uniform(0.0, 0.5, size=2 * layers)
-                params_r, exp_r = self._train_autograd(
-                    init, h, J, layers, device, max_iter, energy_history)
-                if exp_r < best_exp:
+                init_r = rng.uniform(0.0, 0.5, size=2 * layers)
+                params_r, exp_r = train_level(init_r, layers)
+                if exp_r < best_exp or final_params is None:
                     best_exp, final_params = exp_r, params_r
             final_exp = best_exp
         else:
             initial_params = rng.uniform(0.0, np.pi, size=2 * layers)
-            final_params = self._train_cobyla(initial_params, h, J, layers,
-                                              device, max_iter,
-                                              energy_history)
-            final_exp = energy_history[-1]
+            final_params, final_exp = train_level(initial_params, layers)
         q_time = time.time() - q_start
         self.log(f"  optimization time: {q_time:.3f}s, "
                  f"final expectation: {final_exp:.6f}")
@@ -345,7 +466,6 @@ class IsingQAOA(QAOAAlgorithm):
         probs = np.abs(psi) ** 2
         probs = probs / probs.sum()
 
-        e_vec = self._energy_vector(h, J)
         k = min(TOP_K, 2**n)
         top_idx = np.argpartition(probs, -k)[-k:]
         top_idx = top_idx[np.argsort(probs[top_idx])[::-1]]
