@@ -37,7 +37,6 @@ Beta 池 (对冲工具)  ─┘                              ↑
 ```
 quantum_hedge/
 ├── README.md                       ← 本文档
-├── CLAUDE.md                       ← AI 助手项目上下文
 ├── configs/
 │   └── portfolio_default.yaml      ← 组合默认配置
 ├── docs/
@@ -148,15 +147,11 @@ python src/run_real_qaoa.py
 
 ---
 
-## 团队分工
+## 作者
 
-| 线 | 负责人 | 内容 |
-|---|---|---|
-| A | 同事 | 壁仞平台 spike 与 GPU 对接 |
-| B | — | ETF / BTC / XAU / CL 数据 |
-| C | — | 量子核 + QUBO + 经典基线（本仓库主体） |
-| D | — | 金融 pipeline（alpha_selector） |
-| E | — | 回测 |
+**冈部伦太郎（UniXiang）** — 量子核、QUBO 建模、QAOA 求解、金融 pipeline、全栈实现
+
+特别感谢：壁仞平台支持
 
 ---
 
