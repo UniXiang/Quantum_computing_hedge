@@ -147,14 +147,6 @@ python src/run_real_qaoa.py
 
 ---
 
-## 作者
-
-**冈部伦太郎（UniXiang）** — 量子核、QUBO 建模、QAOA 求解、金融 pipeline、全栈实现
-
-特别感谢：壁仞平台支持
-
----
-
 ## License
 
 本项目为 ai4sci 比赛参赛作品。
