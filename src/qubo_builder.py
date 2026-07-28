@@ -62,6 +62,162 @@ def downside_semivariance(returns: pd.DataFrame, shrink: bool = True) -> np.ndar
     return (X.T @ X) / X.shape[0]
 
 
+def benchmark_downside_covariance(
+        returns: pd.DataFrame,
+        benchmark_returns: pd.Series,
+        shrink: bool = True,
+        min_observations: int = 20) -> np.ndarray:
+    """Covariance of full asset returns conditional on benchmark down days.
+
+    Unlike :func:`downside_semivariance`, this keeps positive hedge returns
+    on benchmark-down days. A hedge that rises while stocks fall therefore
+    receives a negative stock/hedge covariance and can genuinely reduce
+    ``w' Sigma_down w``.
+
+    Inputs are inner-aligned by index and rows with any missing value are
+    dropped. Raises when fewer than ``min_observations`` benchmark-down
+    observations remain, because a 24-asset covariance from a tiny tail
+    sample is not meaningful.
+    """
+    if not isinstance(returns, pd.DataFrame):
+        raise TypeError("returns must be a pandas DataFrame")
+    if not isinstance(benchmark_returns, pd.Series):
+        raise TypeError("benchmark_returns must be a pandas Series")
+    if min_observations < 2:
+        raise ValueError("min_observations must be >= 2")
+
+    benchmark_name = "__benchmark__"
+    while benchmark_name in returns.columns:
+        benchmark_name += "_"
+    aligned = returns.join(
+        benchmark_returns.rename(benchmark_name), how="inner").dropna()
+    down = aligned.loc[aligned[benchmark_name] < 0.0, returns.columns]
+    if len(down) < min_observations:
+        raise ValueError(
+            f"need at least {min_observations} aligned benchmark-down "
+            f"observations, got {len(down)}")
+    X = down.to_numpy(dtype=np.float64)
+    if shrink:
+        covariance, _ = ledoit_wolf(X, assume_centered=False)
+    else:
+        covariance = np.cov(X, rowvar=False, ddof=1)
+        covariance = np.atleast_2d(covariance)
+    return np.asarray((covariance + covariance.T) / 2.0,
+                      dtype=np.float64)
+
+
+def build_flexible_selection_qubo(
+        expected_excess: np.ndarray,
+        downside_covariance: np.ndarray,
+        *,
+        exposure_signs: np.ndarray | None = None,
+        exposure_scales: np.ndarray | None = None,
+        betas: np.ndarray | None = None,
+        target_beta: float = 0.6,
+        lambda_return: float = 1.0,
+        lambda_downside: float = 2.0,
+        lambda_beta: float = 1.0,
+        holding_cost: float | np.ndarray = 0.01,
+        previous_selection: np.ndarray | None = None,
+        lambda_turnover: float = 0.0,
+        mutually_exclusive: list[tuple[int, int]] | None = None,
+        conflict_penalty: float = 2.0) -> np.ndarray:
+    """Build a variable-cardinality selection QUBO.
+
+    The binary variables are asset/direction decisions, not continuous
+    weights. No ``(sum(x)-K)^2`` term is present: the number selected is
+    chosen by the return/risk trade-off plus ``holding_cost``. Continuous
+    portfolio weights are allocated in a later classical stage.
+
+    Objective, with signed proxy exposure
+    ``v = exposure_signs * exposure_scales * x``::
+
+        lambda_downside * v' Sigma_down v
+        - lambda_return * expected_excess' v
+        + lambda_beta * (beta' v - target_beta)^2
+        + holding_cost' x
+        + lambda_turnover * |x - previous_selection|
+        + conflict_penalty * sum(x_i*x_j for mutually-exclusive pairs)
+
+    Constants independent of ``x`` are dropped. For an OKX instrument,
+    represent long and short as two variables with signs ``+1``/``-1``
+    and add their pair to ``mutually_exclusive``. ``exposure_scales``
+    converts a selected bit into a realistic proxy weight, so beta and
+    covariance penalties do not treat every selected asset as a 100%
+    position.
+    """
+    alpha = np.asarray(expected_excess, dtype=np.float64)
+    covariance = np.asarray(downside_covariance, dtype=np.float64)
+    if alpha.ndim != 1:
+        raise ValueError("expected_excess must be 1-D")
+    n = len(alpha)
+    if covariance.shape != (n, n):
+        raise ValueError(
+            f"downside_covariance must have shape ({n}, {n}), got "
+            f"{covariance.shape}")
+    if not np.allclose(covariance, covariance.T, atol=1e-12):
+        raise ValueError("downside_covariance must be symmetric")
+
+    signs = (np.ones(n, dtype=np.float64) if exposure_signs is None
+             else np.asarray(exposure_signs, dtype=np.float64))
+    if signs.shape != (n,) or not np.all(np.isin(signs, (-1.0, 1.0))):
+        raise ValueError(
+            f"exposure_signs must have shape ({n},) with values +/-1")
+    scales = (np.ones(n, dtype=np.float64) if exposure_scales is None
+              else np.asarray(exposure_scales, dtype=np.float64))
+    if scales.shape != (n,) or not np.all(np.isfinite(scales)):
+        raise ValueError(
+            f"exposure_scales must contain finite values with shape ({n},)")
+    if np.any(scales <= 0.0):
+        raise ValueError("exposure_scales must be strictly positive")
+    beta = (np.zeros(n, dtype=np.float64) if betas is None
+            else np.asarray(betas, dtype=np.float64))
+    if beta.shape != (n,):
+        raise ValueError(f"betas must have shape ({n},), got {beta.shape}")
+
+    costs = np.asarray(holding_cost, dtype=np.float64)
+    if costs.ndim == 0:
+        costs = np.full(n, float(costs), dtype=np.float64)
+    if costs.shape != (n,):
+        raise ValueError(
+            f"holding_cost must be scalar or shape ({n},), got "
+            f"{costs.shape}")
+
+    signed_exposure = signs * scales
+    signed_covariance = covariance * np.outer(
+        signed_exposure, signed_exposure)
+    signed_alpha = alpha * signed_exposure
+    signed_beta = beta * signed_exposure
+    Q = lambda_downside * signed_covariance
+    Q = Q + lambda_beta * np.outer(signed_beta, signed_beta)
+    diag = np.diag_indices(n)
+    Q[diag] += (
+        -lambda_return * signed_alpha
+        - 2.0 * lambda_beta * target_beta * signed_beta
+        + costs)
+
+    if previous_selection is not None:
+        previous = np.asarray(previous_selection, dtype=np.float64)
+        if previous.shape != (n,) or not np.all(np.isin(previous, (0, 1))):
+            raise ValueError(
+                f"previous_selection must be binary shape ({n},)")
+        # |x_i-p_i| has x-dependent coefficient (1-2p_i).
+        Q[diag] += lambda_turnover * (1.0 - 2.0 * previous)
+
+    for pair in mutually_exclusive or []:
+        if len(pair) != 2:
+            raise ValueError(
+                "each mutually_exclusive entry must contain two indices")
+        i, j = (int(pair[0]), int(pair[1]))
+        if i == j or not (0 <= i < n and 0 <= j < n):
+            raise ValueError(f"invalid mutually-exclusive pair {(i, j)}")
+        # x'Qx counts symmetric off-diagonal entries twice.
+        Q[i, j] += conflict_penalty / 2.0
+        Q[j, i] += conflict_penalty / 2.0
+
+    return np.asarray((Q + Q.T) / 2.0, dtype=np.float64)
+
+
 def build_qubo(returns: pd.DataFrame, K: int, lam: float, A: float,
                gamma: float = 0.0,
                x_prev: np.ndarray | None = None) -> np.ndarray:

@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from qubo_builder import (
+    benchmark_downside_covariance, build_flexible_selection_qubo,
     build_qubo, qubo_to_ising, ising_to_qubo_energy, downside_semivariance,
 )
 from solvers import solve_exact
@@ -145,3 +146,116 @@ def test_build_qubo_input_validation():
     with pytest.raises(ValueError):
         build_qubo(r, K=3, lam=0.1, A=0.01,
                    gamma=0.1, x_prev=np.ones(3))  # wrong x_prev shape
+
+
+# ---------------------------------------------------------------------------
+# 5. Flexible-cardinality real-portfolio objective (Task 4)
+# ---------------------------------------------------------------------------
+def test_benchmark_downside_covariance_rewards_true_hedge():
+    dates = pd.date_range("2025-01-01", periods=12, freq="B")
+    benchmark = pd.Series(
+        [-0.03, -0.02, -0.015, -0.01, -0.025, -0.005,
+         0.01, 0.02, 0.005, 0.015, 0.01, 0.02],
+        index=dates)
+    # On benchmark-down days stock falls with the market while hedge rises.
+    stock = benchmark.to_numpy() * 1.1 + np.linspace(-0.001, 0.001, 12)
+    hedge = -benchmark.to_numpy() * 0.8 + np.linspace(0.001, -0.001, 12)
+    returns = pd.DataFrame(
+        {"stock": stock, "hedge": hedge}, index=dates)
+    covariance = benchmark_downside_covariance(
+        returns, benchmark, shrink=False, min_observations=6)
+    assert covariance.shape == (2, 2)
+    assert covariance[0, 1] < 0.0
+    w_stock = np.array([1.0, 0.0])
+    w_mixed = np.array([0.5, 0.5])
+    assert w_mixed @ covariance @ w_mixed < (
+        w_stock @ covariance @ w_stock)
+
+
+def test_benchmark_downside_covariance_rejects_tiny_tail_sample():
+    returns = make_returns(T=10, N=3)
+    benchmark = pd.Series(
+        [0.01] * 8 + [-0.01] * 2, index=returns.index)
+    with pytest.raises(ValueError, match="observations"):
+        benchmark_downside_covariance(
+            returns, benchmark, min_observations=3)
+
+
+def test_flexible_qubo_matches_documented_objective():
+    rng = np.random.default_rng(40)
+    n = 5
+    alpha = rng.normal(0.0, 0.1, n)
+    raw = rng.normal(size=(n, n))
+    covariance = raw.T @ raw / 100.0
+    signs = np.array([1, 1, 1, 1, -1], dtype=np.float64)
+    scales = rng.uniform(0.03, 0.12, n)
+    betas = rng.normal(0.5, 0.2, n)
+    costs = np.linspace(0.01, 0.03, n)
+    previous = np.array([1, 0, 1, 0, 0], dtype=np.float64)
+    target = 0.6
+    lr, ld, lb, lt, conflict = 1.2, 2.3, 0.7, 0.11, 1.5
+    Q = build_flexible_selection_qubo(
+        alpha, covariance, exposure_signs=signs,
+        exposure_scales=scales, betas=betas,
+        target_beta=target, lambda_return=lr, lambda_downside=ld,
+        lambda_beta=lb, holding_cost=costs,
+        previous_selection=previous, lambda_turnover=lt,
+        mutually_exclusive=[(3, 4)], conflict_penalty=conflict)
+
+    dropped_constant = lb * target**2 + lt * previous.sum()
+    for _ in range(50):
+        x = rng.integers(0, 2, n).astype(np.float64)
+        v = signs * scales * x
+        full = (
+            ld * (v @ covariance @ v)
+            - lr * (alpha @ v)
+            + lb * (betas @ v - target)**2
+            + costs @ x
+            + lt * np.abs(x - previous).sum()
+            + conflict * x[3] * x[4])
+        assert float(x @ Q @ x) == pytest.approx(
+            full - dropped_constant, abs=1e-10)
+
+
+def test_flexible_qubo_selection_count_is_not_fixed():
+    alpha = np.array([0.30, 0.15, 0.05])
+    covariance = np.zeros((3, 3))
+    Q = build_flexible_selection_qubo(
+        alpha, covariance, lambda_downside=0.0, lambda_beta=0.0,
+        holding_cost=0.10)
+    x, _ = solve_exact(Q)
+    assert x.tolist() == [1, 1, 0]
+    assert x.sum() == 2  # neither a fixed K nor all assets
+
+    Q_sparse = build_flexible_selection_qubo(
+        alpha, covariance, lambda_downside=0.0, lambda_beta=0.0,
+        holding_cost=0.20)
+    x_sparse, _ = solve_exact(Q_sparse)
+    assert x_sparse.tolist() == [1, 0, 0]
+    assert x_sparse.sum() == 1
+
+
+def test_flexible_qubo_long_short_direction_conflict():
+    alpha = np.array([0.2, 0.2])
+    covariance = np.zeros((2, 2))
+    Q = build_flexible_selection_qubo(
+        alpha, covariance, exposure_signs=np.array([1.0, -1.0]),
+        lambda_downside=0.0, lambda_beta=0.0, holding_cost=0.0,
+        mutually_exclusive=[(0, 1)], conflict_penalty=2.0)
+    e_long = np.array([1.0, 0.0]) @ Q @ np.array([1.0, 0.0])
+    e_both = np.array([1.0, 1.0]) @ Q @ np.array([1.0, 1.0])
+    # Selecting long+short pays the exact configured conflict penalty.
+    base_both = -0.2 + 0.2
+    assert e_both == pytest.approx(base_both + 2.0)
+    assert e_both > e_long
+
+
+def test_flexible_qubo_exposure_scale_validation():
+    alpha = np.array([0.1, 0.2])
+    covariance = np.eye(2)
+    with pytest.raises(ValueError, match="strictly positive"):
+        build_flexible_selection_qubo(
+            alpha, covariance, exposure_scales=np.array([0.1, 0.0]))
+    with pytest.raises(ValueError, match="shape"):
+        build_flexible_selection_qubo(
+            alpha, covariance, exposure_scales=np.array([0.1]))

@@ -13,20 +13,22 @@
 
 构建日频调仓的多空对冲组合：
 
-- **alpha 池**：现有框架识别领先板块 → 板块内动量排序取 top N 个股
-- **beta 池（对冲工具）**：BTC/XAU 永续（可做空）+ 场内 ETF（黄金 518880、原油、豆粕等，只能做多）
-- **目标**：不预设固定对冲比，由量子优化器在下行半方差目标下自行学出非对称的权重结构（下行保护优先于上行参与）
+- **alpha 池**：约500只可交易股票 → 价格多因子/板块分散漏斗 → 18只决赛候选
+- **beta 池（对冲工具）**：OKX BTC/CL/XAU 合约，每个允许 long/short/off
+- **目标**：不固定入选数量；量子优化器选择股票与合约方向，经典优化器分配连续仓位，使超额收益、市场下跌日风险和 Beta=0.6 目标达到折中
 
 ### 1.2 已确认的关键决策（头脑风暴结论）
 
 | 维度 | 决策 |
 |---|---|
 | 量子地位 | 比赛核心评审点，必须展示量子 vs 经典求解器的严格对比 |
-| 目标函数 | 下行半方差（downside semivariance），非对称权重交给优化器 |
-| beta 池 | BTC/XAU 永续（可做空）+ 场内 ETF（做多低/负相关） |
-| alpha 池 | 板块识别 + 板块内动量排序 |
-| 调仓频率 | 日频 |
+| 目标函数 | 价格多因子超额收益 − 市场下跌日条件协方差风险 − Beta偏差/换手/持仓成本 |
+| beta 池 | OKX BTC-USDT-SWAP、CL-USDT-SWAP、XAU-USDT，均允许多空但禁止同合约同时多空 |
+| alpha 池 | 约500只 → 价格多因子 + 板块分散 → 18只决赛候选 |
+| 入选数量 | 不固定；软持仓成本控制稀疏度，不使用精确 K 惩罚 |
+| 调仓频率 | 周频，t日收盘信号、t+1收益生效 |
 | 计算平台 | 壁仞 GPU（BR100，64GB HBM），PyTorch torch backend |
+| 回测口径 | 第一版仅按价格走势计算；不含手续费、滑点、资金费率、保证金、强平、合约乘数、基差/移仓 |
 
 ### 1.3 已排除的思路（及原因）
 
@@ -48,17 +50,16 @@ NISQ 时代量子优化在小规模上不可能赢经典精确方法，本项目
 - 验证 QUBO→Ising 编码正确性（QAOA 解 vs 精确解的逼近率）
 - 快速回归测试
 
-### 2.2 交叉窗口（n=24-28）
+### 2.2 交叉窗口（n=24 主结果；n=28 可选资源外推）
 
 穷举需分钟-小时级，QAOA 在可接受时间内达到高逼近率。展示：
 - 逼近率随 QAOA 层数 p 的收敛曲线
 - 同时间预算下 QAOA vs 模拟退火的解质量对比
 
-### 2.3 经典精确失效区（n=30-32，壁仞 GPU 主场）
+### 2.3 资源外推区（n>24，不作为当前验收）
 
-- 2^30 ≈ 10 亿组合，穷举实际不可行；基线改为最强经典启发式（长预算 SA / Gurobi 限时）
-- **CPU vs 壁仞 GPU scaling benchmark**（n=16→32 同负载）是命中"国产 GPU"赛题的核心交付物
-- statevector 内存：complex128 每振幅 16B，n=30→16GB，n=31→32GB，n=32→64GB（需 complex64 压到 32GB）
+- 当前主结果固定 n=24；更大规模仅报告理论态矢量/分析内存，不宣称已在32GB Biren106M实跑
+- 经典基线使用 SA；量子结果不可行时必须回退，不以全空间惩罚项美化结果
 
 ### 2.4 量子独有能力：解分布采样
 
@@ -75,52 +76,50 @@ QAOA 输出是概率分布而非单解。top-K 高概率比特串 = K 个近最�
 ## 3. 系统架构
 
 ```
-经典漏斗（全量）              量子核（GPU, n=30-32）          经典执行/回测
-5199只股票 (bs_cache_1year)
-  ↓ 板块识别（concept_dragon 复用）
-领先板块
-  ↓ 板块内动量排序
-alpha 候选 12 只
-beta 工具池 8 个 (BTC/XAU 永续 + 场内ETF)
-  ↓ 滚动60日窗口 → 下行半方差矩阵 Σ⁻、收益向量 μ
+经典漏斗（约500只）              量子核（GPU, n=24）           经典权重/走势回测
+可交易股票池
+  ↓ 20/60/120日动量 + 下行调整收益 + 低波动 + 流动性 + 板块分散
+alpha 决赛候选 18只
+OKX BTC/CL/XAU × (long, short) = 6个方向变量
+  ↓ 市场下跌日条件协方差 Σ↓、超额收益 α、Beta向量
 QUBO 矩阵 → Ising (h, J)
   ↓ QAOA 求解（unitarylab torch backend, device=壁仞GPU）
 top-K 比特串（近最优组合分布）
-  ↓ 经典连续权重分配（选中子集上闭式半方差最小化）
+  ↓ 方向互斥检查；不可行则SA回退；选中子集上连续凸优化
 目标持仓
-  ↓ t+1 成交模拟（T+1、涨跌停、手续费、滑点）
-回测净值 / 绩效归因 / replay 验证
+  ↓ t+1价格收益（第一版忽略交易/合约现实细节）
+简化走势净值 / alpha与对冲方向归因
 ```
 
-**两阶段分解**：量子负责离散选择（资产进/出 + 对冲比档位），经典负责连续权重。这是 qubit 预算下的标准做法。
+**两阶段分解**：量子负责离散选择（股票进/出 + OKX方向），经典负责连续多空权重。这是 qubit 预算下的标准做法。
 
 ---
 
 ## 4. QUBO 编码设计（核心技术点）
 
-### 4.1 qubit 分配（n=32 目标配置）
+### 4.1 qubit 分配（n=24 已确认配置）
 
 | 段 | qubit 数 | 含义 |
 |---|---|---|
-| alpha 候选选择 | 12 | 每只股票 1 qubit，进/出 |
-| beta 工具选择 | 8 | 每个工具 1 qubit，进/出；BTC/XAU 腿允许负权重（做空） |
-| 对冲比率 | 6 | 64 档，0%~150% 名义对冲比 |
-| 板块间配置 | 4 | 2 个领先板块间的资金分配档位（16 档） |
-| 预留 | 2 | 实验余量 |
+| alpha 候选选择 | 18 | 每只股票 1 qubit，1=入选做多 |
+| BTC方向 | 2 | long / short；允许均为0，禁止同时为1 |
+| CL方向 | 2 | long / short；允许均为0，禁止同时为1 |
+| XAU方向 | 2 | long / short；允许均为0，禁止同时为1 |
 
-n=16 回归配置：alpha 6 + beta 4 + 对冲比 4 + 板块配置 2。
+入选数量不固定。`holding_cost * sum(x)` 是稀疏正则，不是目标数量；同合约 long/short 用 `conflict_penalty*x_long*x_short` 互斥。
 
 ### 4.2 目标函数
 
 ```
-min  w'·Σ⁻·w  −  λ·μ'·w  +  γ·|w − w_prev|（换手惩罚）
-s.t. 持仓数量约束（cardinality，作为惩罚项）
-     个股权重上下限
-     beta 做空腿仅 BTC/XAU 永续允许
+min  v'·Σ↓·v − λR·alpha'·v + λB·(beta'·v−0.6)^2
+     + holding_cost'·x + γ·|x−x_prev|
+     + Σcontract Aconflict·x_long·x_short
 ```
 
-- Σ⁻：滚动 60 日窗口的下行半方差协方差矩阵（只用 t 日前数据，无未来函数），做 Ledoit-Wolf 收缩
-- w 由选择比特 + 档位比特解码为离散权重网格
+- `v = sign*x` 是选择阶段的方向代理暴露；股票/long为+1，short为−1
+- Σ↓：只取沪深300下跌日，但保留所有资产完整正负收益的条件协方差，做 Ledoit-Wolf 收缩
+- alpha：20/60/120日价格多因子预测相对候选池平均的超额收益
+- 数量由目标函数内生决定；连续仓位在入选子集上另行优化
 - QUBO 矩阵 Q 经标准变换 x∈{0,1} → z∈{−1,+1} 映射为 Ising 模型：局部场 h_i + 耦合 J_ij
 
 ### 4.3 unitarylab QAOA 扩展（比赛贡献点之一）
@@ -149,13 +148,13 @@ n=30 时 COBYLA 无梯度优化每次迭代都要演化 10 亿维态矢量，不
 
 | 模块 | 职责 | 关键接口 | 依赖 |
 |---|---|---|---|
-| `alpha_selector.py` | 板块识别 + 板块内动量排序，日产出 12 只 alpha 候选（含所属板块标签） | `select(date) -> DataFrame[code, sector, momentum_score]` | bs_cache_1year，concept_dragon 复用 |
-| `beta_pool.py` | 固定 8 个对冲工具的日收益率序列（对齐 A 股交易日历） | `returns(date, window) -> DataFrame` | baostock（ETF）+ OKX 下载（BTC/XAU） |
+| `alpha_selector.py` | 约500只股票价格多因子 + 板块分散，日产出18只决赛候选 | `select(date) -> DataFrame[code, sector, factor_score]` | bs_cache_1year，concept_dragon 复用 |
+| `beta_pool.py` | BTC/CL/XAU日收益并展开long/short方向变量 | `returns(date, window) -> DataFrame` | 已有OKX日线CSV |
 | `qubo_builder.py` | 滚动窗口 → Σ⁻(收缩)、μ → QUBO Q 矩阵 → Ising (h, J) | `build(alpha_df, beta_df, prev_w, date) -> (h, J, meta)` | numpy, sklearn |
 | `ising_qaoa.py` | 继承 unitarylab QAOAAlgorithm，加权 Ising + 局部场 + autograd 训练 | `solve(h, J, layers, device) -> dict[bitstring, prob]` | unitarylab_algorithms |
 | `solvers.py` | 三通道基线：穷举（n≤16）/ SA / Gurobi 限时（n≥30） | `solve_exact(Q)`, `solve_sa(Q, budget)`, `solve_gurobi(Q, limit)` | scipy, gurobipy(可选) |
 | `weight_allocator.py` | 选中子集上的经典连续权重（半方差 QP 求解 / 风险平价） | `allocate(selected, Sigma_minus) -> w` | scipy |
-| `backtest.py` | t 日信号 → t+1 成交；T+1、涨跌停、手续费、滑点；日频 replay | `run(signals) -> nav, attribution` | 复用现有回测基座 |
+| `backtest.py` | t日信号 → t+1价格方向收益；第一版不含执行/合约成本细节 | `run(signals) -> nav, attribution` | 简化走势实验 |
 | `benchmark_gpu.py` | CPU vs 壁仞 GPU scaling benchmark（n=16→32） | `sweep(ns, devices) -> timing_df` | torch |
 | `run_daily.py` | 日频编排：数据更新 → alpha 选择 → QUBO → 求解 → 权重 → 落盘 | CLI | 以上全部 |
 
@@ -181,14 +180,16 @@ n=30 时 COBYLA 无梯度优化每次迭代都要演化 10 亿维态矢量，不
 
 ---
 
-## 7. 回测设计
+## 7. 回测设计（第一版简化走势实验）
 
-- **信号时点**：t 日收盘后出信号，t+1 日开盘价成交（不假设收盘价成交）
-- **约束**：A 股 T+1；涨停不买、跌停不卖；ETF 同股票规则；BTC/XAU 永续无涨跌停但有资金费率（按历史均值计入成本）
-- **成本**：股票双边佣金+印花税，ETF 佣金，永续 taker 费率 + 资金费率；滑点按日波动率比例计
+- **信号时点**：t 日收盘后出信号，使用 t+1 日收益，严格无未来函数
+- **调仓**：周频，单次目标换手上限20%
+- **合约方向收益**：long使用 `+r`，short使用 `−r`
+- **明确忽略**：手续费、滑点、资金费率、保证金、强平、合约乘数、基差和移仓
+- **解释边界**：输出只表示价格走势上的方向策略收益，不是可实现净收益或实盘风险报告
 - **评估指标**：年化、最大回撤、下行偏差、Calmar、对冲腿贡献归因（alpha 收益 vs 对冲损益分解）
 - **replay 验证**：按用户 10 步复盘框架执行关键日回放
-- **禁令遵守**：无未来函数、不假设完美成交、信号 repaint 检查（同一日期两次运行结果一致）
+- **禁令遵守**：无未来函数、信号 repaint 检查（同一日期两次运行结果一致）
 
 ---
 
@@ -235,6 +236,6 @@ n=30 时 COBYLA 无梯度优化每次迭代都要演化 10 亿维态矢量，不
 ## 11. 里程碑
 
 1. **M0（第 1 周）**：平台 spike 结论 + 数据补齐 + n=16 端到端跑通（CPU）
-2. **M1（第 2-3 周）**：Ising 扩展 + 三通道基线 + n=16/24/28 逼近率曲线
-3. **M2（第 3-4 周）**：壁仞 GPU n=30-32 + CPU/GPU benchmark + 日频回测全量 replay
+2. **M1（第 2-3 周）**：Ising 扩展 + 三通道基线 + n=16/24 逼近率曲线（n=28 仅作可选资源外推）
+3. **M2（第 3-4 周）**：18只股票+3个OKX多空方向的真实n=24组合 + 连续权重 + 简化走势回测
 4. **M3（第 4-5 周）**：稳健性实验（窗口/收缩/layers）+ 解分布分析 + 报告撰写

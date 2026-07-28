@@ -144,6 +144,46 @@ def test_checkpoint_gradient_matches_direct(algo):
                                rtol=1e-10, atol=1e-12)
 
 
+@pytest.mark.parametrize("dtype,rtol,atol", [
+    ("complex128", 1e-10, 1e-12),
+    ("complex64", 2e-4, 2e-5),
+])
+def test_adjoint_gradient_matches_eager(algo, dtype, rtol, atol):
+    """The constant-scratch adjoint must reproduce eager autograd."""
+    h, J = make_instance(5, seed=206)
+    rdtype = torch.float64 if dtype == "complex128" else torch.float32
+    e_vec_t = torch.as_tensor(algo._energy_vector(h, J), dtype=rdtype)
+    init = np.random.default_rng(10).uniform(0.0, 0.5, size=6)
+
+    grads = {}
+    energies = {}
+    for adjoint in (False, True):
+        p = torch.as_tensor(init, dtype=rdtype).clone().requires_grad_(True)
+        psi = algo._evolve_torch(
+            p, h, J, device="cpu", e_vec=e_vec_t,
+            dtype=getattr(torch, dtype), adjoint=adjoint)
+        energy = torch.sum((psi.real**2 + psi.imag**2) * e_vec_t)
+        energy.backward()
+        energies[adjoint] = energy.detach()
+        grads[adjoint] = p.grad.detach()
+    torch.testing.assert_close(
+        energies[True], energies[False], rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        grads[True], grads[False], rtol=rtol, atol=atol)
+
+
+def test_adjoint_training_trajectory_matches_eager(algo):
+    h, J = make_instance(6, seed=207)
+    common = dict(layers=3, device="cpu", optimizer="autograd",
+                  max_iter=20, seed=17, dtype="complex128")
+    eager = algo.solve(h, J, adjoint=False, **common)
+    compact = algo.solve(h, J, adjoint=True, **common)
+    assert compact["energy_history"] == pytest.approx(
+        eager["energy_history"], rel=1e-9, abs=1e-11)
+    assert compact["best_bitstring"] == eager["best_bitstring"]
+    assert compact["best_energy"] == pytest.approx(eager["best_energy"])
+
+
 # ---------------------------------------------------------------------------
 # 4. resolve_device adapter
 # ---------------------------------------------------------------------------
@@ -211,3 +251,30 @@ def test_memory_model_dtype_halves_state(algo):
     m64 = estimate_evolve_memory(20, 2, dtype="complex64")
     # statevector bytes: 2^20 * 16 vs 2^20 * 8
     assert m128["state_bytes"] == 2 * m64["state_bytes"]
+
+
+def test_memory_model_adjoint_n24_reduces_retained_activations(algo):
+    model = estimate_evolve_memory(
+        24, 4, dtype="complex64", checkpoint=True, adjoint=True)
+    assert model["total_bytes"] < 32 * GiB, (
+        f"adjoint n=24 p=4 retained-activation estimate is "
+        f"{model['total_bytes']/GiB:.2f} GiB")
+
+
+def test_native_final_backend_matches_unitarylab(algo):
+    h, J = make_instance(7, seed=208)
+    e_vec = algo._energy_vector(h, J)
+    common = dict(layers=2, max_iter=20, seed=19,
+                  energy_vector=e_vec)
+    native = algo.solve(h, J, final_backend="native", **common)
+    anchor = algo.solve(h, J, final_backend="unitarylab", **common)
+    assert native["best_bitstring"] == anchor["best_bitstring"]
+    assert native["best_energy"] == pytest.approx(anchor["best_energy"])
+    assert native["bitstrings"] == pytest.approx(
+        anchor["bitstrings"], rel=1e-6, abs=1e-9)
+
+
+def test_precomputed_energy_vector_validation(algo):
+    h, J = make_instance(5, seed=209)
+    with pytest.raises(ValueError, match="energy_vector"):
+        algo.solve(h, J, max_iter=1, energy_vector=np.zeros(7))

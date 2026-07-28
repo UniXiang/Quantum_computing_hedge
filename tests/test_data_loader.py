@@ -55,6 +55,15 @@ def test_code_normalization():
     pd.testing.assert_frame_equal(r1, r3)
 
 
+def test_us_cache_code_normalization_and_cutoff():
+    """US cache files use us_TICKER labels and obey the same cutoff rule."""
+    r1 = load_returns(["us_AAPL"], "2026-07-03", 10)
+    r2 = load_returns(["us.AAPL"], "2026-07-03", 10)
+    assert list(r1.columns) == ["us_AAPL"]
+    assert str(r1.index[-1]) <= "2026-07-03"
+    pd.testing.assert_frame_equal(r1, r2)
+
+
 def test_no_future_data_end_date_shift():
     """Shifting end_date back one trading day must only roll the window:
     overlapping dates keep identical values, and no data after the new

@@ -53,16 +53,23 @@ quantum_hedge/
 ├── docs/
 │   ├── progress.md         ← 进度台账（看板）
 │   └── 2026-07-25-...md    ← 设计文档
+├── configs/
+│   └── portfolio_default.yaml ← 用户确认的真实组合默认配置
 ├── src/
-│   ├── ising_qaoa.py       ← 量子核：IsingQAOA（autograd/cobyla/complex64/checkpoint/INTERP）
-│   ├── qubo_builder.py     ← QUBO构建：下行半方差+LW收缩+Ising映射
+│   ├── ising_qaoa.py       ← 量子核：IsingQAOA（autograd/伴随反传/complex64/checkpoint/INTERP）
+│   ├── qubo_builder.py     ← QUBO：条件下行协方差+可变持仓+多空互斥+Ising
 │   ├── data_loader.py      ← bs_cache日线加载（end_date严格截断）
+│   ├── real_portfolio.py   ← 真实24变量数据/因子/QUBO/连续仓位pipeline
+│   ├── run_real_portfolio.py ← 18股+3合约SA组合CLI
+│   ├── run_real_qaoa.py    ← 导出Hamiltonian的壁仞p=1 QAOA入口
 │   ├── solvers.py          ← 经典基线：穷举+SA(_flip_delta验证)
 │   ├── validate_n16.py     ← n=16三通道验证脚本
+│   ├── validate_n24_n28.py ← T3.3 壁仞n=24 QAOA vs同预算SA实验
 │   └── smoke_qaoa.py
-├── tests/                  ← 85 passed + 1 skipped（本地），79 passed + 7 skipped（壁仞）
+├── tests/                  ← 104 passed + 1 skipped（本地）
 ├── scripts/
-│   └── t32_remote_check.sh ← T3.2 远端一键验证脚本
+│   ├── t32_remote_check.sh ← T3.2 远端一键验证脚本
+│   └── t33_remote_run.sh   ← T3.3 n=24断点式实验脚本
 ├── data/crypto_daily/      ← B线产出：BTC/XAU/CL日线（未入库）
 └── third_party/            ← unitarylab_algorithms + quantum-skills vendor副本
 
@@ -98,6 +105,6 @@ quantum_hedge/
 | T2 | QUBO + SA + n16 | ✅ |
 | T3.1 | e_vec分块 + INTERP | ✅ |
 | T3.2 | complex64 + checkpoint + biren适配 | ✅ |
-| T3.3 | 壁仞 n=24/28 实验 | ⬜ 待启动 |
-| T4 | 金融 pipeline | ⬜ |
+| T3.3 | 壁仞 n=24 实验 | ✅ 跑数完成（p=1最优，p=2/4不可行） |
+| T4 | 金融 pipeline | 🟡 混合A/美股真实n=24；壁仞改进p=1命中基态，SA保留兜底 |
 | T5 | 回测 | ⬜ |

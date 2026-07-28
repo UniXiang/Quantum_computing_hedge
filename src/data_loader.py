@@ -1,7 +1,8 @@
 """data_loader.py — load daily returns from the bs_cache_1year pkl cache.
 
 Follows the conventions of /mnt/f/Gaming/load_1year_data.py:
-  - files are named ``{exchange}_{code6}_1year.pkl`` (e.g. sh_600000_1year.pkl)
+  - mainland files are named ``{exchange}_{code6}_1year.pkl`` (for example
+    ``sh_600000_1year.pkl``); US files are ``us_{ticker}_1year.pkl``
   - each pkl is a DataFrame with string columns:
     date, code (e.g. 'sh.600000'), open/high/low/close/preclose, volume,
     amount, turn, tradestatus, pctChg, isST
@@ -34,20 +35,34 @@ CACHE_DIR = "/mnt/f/Gaming/bs_cache_1year"
 
 
 def _normalize_code(code: str) -> str:
-    """Normalize to 6-digit code: '600000', 'sh.600000', 'sh_600000',
-    'sh600000' all -> '600000'."""
-    m = re.search(r"(\d{6})", str(code))
-    if not m:
-        raise ValueError(f"cannot parse stock code: {code!r}")
-    return m.group(1)
+    """Normalize mainland and US cache codes.
+
+    Mainland examples ``'600000'``, ``'sh.600000'`` and ``'sh_600000'``
+    become ``'600000'``. US examples ``'us_AAPL'``, ``'us.AAPL'`` and
+    ``'US-AAPL'`` become ``'us_AAPL'``. Keeping the US prefix in the column
+    label prevents collisions and makes the cache source explicit.
+    """
+    raw = str(code).strip()
+    numeric = re.search(r"(\d{6})", raw)
+    if numeric:
+        return numeric.group(1)
+    us = re.fullmatch(r"us[._-]([A-Za-z][A-Za-z0-9.-]*)", raw,
+                      flags=re.IGNORECASE)
+    if us:
+        return f"us_{us.group(1).upper()}"
+    raise ValueError(f"cannot parse stock code: {code!r}")
 
 
 def _file_for(code6: str, cache_dir: str) -> Path:
-    # exchange prefix from the code (same convention as the cache)
-    prefix = "sh" if code6[0] in ("5", "6", "9") else "sz"
-    path = Path(cache_dir) / f"{prefix}_{code6}_1year.pkl"
+    """Resolve a canonical mainland code or ``us_TICKER`` cache file."""
+    if code6.startswith("us_"):
+        path = Path(cache_dir) / f"{code6}_1year.pkl"
+    else:
+        # exchange prefix from the code (same convention as the cache)
+        prefix = "sh" if code6[0] in ("5", "6", "9") else "sz"
+        path = Path(cache_dir) / f"{prefix}_{code6}_1year.pkl"
     if not path.exists():
-        # fall back: the other exchange (defensive; e.g. unusual prefixes)
+        # Defensive fallback for unusual mainland prefixes / cache casing.
         alt = list(Path(cache_dir).glob(f"*_{code6}_1year.pkl"))
         if alt:
             return alt[0]
@@ -72,8 +87,9 @@ def load_returns(codes: list[str], end_date: str, window: int,
 
     Parameters
     ----------
-    codes : list of stock codes in any common format ('600000',
-        'sh.600000', 'sh_600000'); columns are labeled by 6-digit code.
+    codes : list of mainland codes in common formats ('600000',
+        'sh.600000', 'sh_600000') and/or US codes ('us_AAPL', 'us.AAPL').
+        Columns use canonical 6-digit / ``us_TICKER`` labels.
     end_date : 'YYYY-MM-DD', inclusive. Strictly no data after this date
         is used (no look-ahead).
     window : number of trading days in the returned matrix.

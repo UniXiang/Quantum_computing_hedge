@@ -1,9 +1,92 @@
 # SDD Progress Ledger — quantum_hedge
 
 ## 当前状态（2026-07-27）
-- **本地**：85 passed + 1 skipped，工作树干净（db6591a）
-- **壁仞远端**：79 passed + 7 skipped in 17.85s，SSH 双因素已配置，代码已同步
-- **下一个 Task**：T3.3（壁仞远端 n=24/28 QAOA vs SA 实验，验收指标=可行子空间内相对 gap）
+- **本地**：T3.3 实现完成，95 passed + 1 skipped；尚未提交
+- **壁仞远端**：T3.2 代码 79 passed + 7 skipped in 17.85s；T3.3 尚未同步
+- **当前 Task**：T3.3 壁仞 n=24 跑数完成；待决定是否用 INTERP 重跑 p=2/4
+- **计划调整**：主结果固定为 n=24；n=28 不再作为验收项，仅保留为后续资源外推
+
+Task 4.1: real n=24 pipeline and Biren p=1 QAOA complete
+- 2026-07-28配置替换为：11只指定A股 + 7只 `us_*` 美股构成18个
+  long-only alpha；农业银行、贵州茅台、药明康德、东方财富各一个long变量，
+  加XAU long/short构成6个对冲变量
+- 美股缓存支持已加入 `data_loader`；美股当日收盘晚于A股，信号构建时严格
+  滞后一条A股交易日，避免时区导致的未来函数
+- 新窗口为119个A股交易日、57个基准下跌日；新SA/精确最优能量
+  `-0.361293309252285`，选7个alpha加药明康德对冲，连续层总/净敞口40%，
+  beta=0.5922
+- A/B/C改进已落地：保存最佳QAOA参数、显式warm-start p=2、p=1多种子与
+  top-65536、Ising正比例缩放与目标分项诊断、每个实验run写断点JSON
+- 壁仞新p=1（seed42，60 iter × 3内部重启）在1684.95秒命中精确基态，
+  gap=0；p=2路径已实现但因p=1已达全局最优而停止冗余运行
+- 详细报告：`docs/real_portfolio_us_2026-07-03.md`；结果：
+  `results/real_portfolio_us_2026-07-03.json`、
+  `results/real_n24_us_qaoa_abc.json`
+- 用户确认配置：持仓数量不固定；其余采用默认方案
+  R1-D1-H(OKX多空)-B1-W1-T1-S1-M1
+- 24变量新分配：18只股票决赛候选 + BTC/CL/XAU各long/short两个方向；
+  同合约禁止同时多空
+- 新增 `configs/portfolio_default.yaml`：软持仓成本、Beta目标0.6、
+  周频、QAOA p=1 + SA回退、连续凸优化约束
+- 新增 `benchmark_downside_covariance`：沪深300下跌日保留资产完整正负
+  收益，能够用负交叉协方差识别真实对冲
+- 新增 `build_flexible_selection_qubo`：无精确K惩罚，包含超额收益、
+  条件下行风险、Beta偏差、软持仓成本、换手、OKX方向互斥
+- 回测口径明确为 `trend_only_simplified`：long=+r、short=−r；暂不计
+  手续费、滑点、资金费率、保证金、强平、合约乘数、基差/移仓。该结果
+  只代表价格方向实验，不代表可实现净收益
+- 验证：`tests/test_qubo_builder.py` 17 passed；全仓 104 passed + 1 skipped
+- 用户指定的18只股票缓存全部存在；实际目录为 `../bs_cache_1year`
+- 共同截止日 2026-07-03（受XAU数据末日限制），CL限制实际共同窗口为
+  83个A股交易日，其中沪深300 ETF下跌39日
+- 新增 `real_portfolio.py`：严格截断数据、BTC/CL/XAU价格级对齐、
+  价格多因子、市场beta、24变量真实QUBO、SLSQP连续仓位
+- 选择代理尺度为股票5%、合约方向8%，只用于Hamiltonian量纲，不是
+  最终仓位或固定数量；持仓成本按代理敞口缩放
+- 2026-07-03 SA结果：8只股票 + BTC/CL/XAU short，连续层总敞口
+  52.90%、净敞口40.00%、beta=0.6192；24-bit全能量表确认SA选择与
+  全局最优逐位一致，能量差约2e-15
+- 输出：`results/real_portfolio_2026-07-03.json`；
+  `results/real_n24_instance.npz` 可直接送壁仞，不需要上传私人行情缓存
+- 本地全仓验证更新为104 passed + 1 skipped
+- 壁仞真实p=1：complex64、adjoint、checkpoint、20 iter、top-4096，
+  优化558.1s，总QAOA 563.2s；采样QUBO能量-0.3709063932，
+  全局最优-0.3798642749，absolute gap=0.0089578817，未命中基态
+- QAOA解在全部2^24状态中排名约1036（前0.0062%），选7只股票且
+  无对冲方向；全局最优bitstring不在QAOA top-4096
+- 按既定 `QAOA + SA fallback` 规则，最终采用SA命中的全局最优
+  8股+BTC/CL/XAU三条short，而不采用本次QAOA样本
+- 壁仞结果已取回：`results/real_n24_qaoa.{json,log}`
+
+Task 3.3: experiment complete (n=24; mixed QAOA result)
+- 交付：`validate_n24_n28.py`（确定性合成因子收益组合实例、e_vec跨p复用、
+  精确可行子空间分块枚举、QAOA top-4096 后按 K 后选择、同标称预算 SA、
+  每个深度断点写 JSON/Markdown）、`t33_remote_run.sh`
+- 新增逐层解析伴随反传，梯度与 eager autograd 在 complex128/64 下钉死；
+  主验收规模已调整为 n=24，不再以分析模型宣称 n=28 可装入 32 GiB
+- 大规模 Stage 3 改为 torch 原生设备内 `topk`，避免 unitarylab 将
+  n=28 complex128 全态矢量搬回主机；小 n 默认仍走 unitarylab 锚点
+- 验收指标：
+  `gap=(E_candidate-E_feasible_best)/(E_feasible_worst-E_feasible_best)`，
+  越低越好；非 K 解不计分，禁止用惩罚主导的全空间 worst 美化结果
+- 本地验证：95 passed + 1 skipped；远端同步后 89 passed + 7 skipped；
+  n=12 CPU/SUPA 伴随梯度相对差 < 1e-6。执行
+  `sshpass -e ssh biren 'bash -s' < scripts/t33_remote_run.sh`
+- 壁仞适配实测：
+  - OpenBLAS 0.3.20 默认 64 线程会静默污染 n=24 高瘦 GEMM 后续分块；
+    `_energy_vector` 已局部锁为单 BLAS 线程，n=24 全表映射复核通过
+  - SUPA 不支持 n=24 高维 shape，mixer 已改为 LSB 等价的
+    `(-1, 2, 2^k)` rank-3 分组；训练显存稳定约 7.6–8.6 GiB
+  - p=1：QAOA 557.1s，命中 K=12 精确最优，feasible gap=0.0；
+    同预算 SA 260.7s，gap=0.0
+  - p=2：QAOA 1099.4s，top-4096 无 K=12 解（gap 不计）；
+    SA 510.4s，gap=0.0
+  - p=4：QAOA 2187.8s，top-4096 无 K=12 解（gap 不计）；
+    SA 1019.5s，gap≈7.8e-11
+  - 失败形态：p=2 高概率池主要为 K=9，p=4 主要为 K=19；
+    随机初始化在更深电路上落入错误基数扇区，后续可用 INTERP 重跑验证
+  - 结果：远端 `results/t33_n24.{json,md}`；本地副本
+    `results/t33_n24.remote.{json,md}`
 
 Task 3.2: complete (commits 2a72345..db6591a, review clean)
 - 交付：complex64开关（默认complex128不变）、per-layer checkpointing（默认False）、resolve_device适配（biren/supa统一入口+清晰报错）、t32_remote_check.sh远端一键脚本、16项新测试

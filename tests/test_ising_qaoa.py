@@ -17,7 +17,9 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from ising_qaoa import IsingQAOA, ising_energy, bitstring_of_index
+from ising_qaoa import (
+    IsingQAOA, bitstring_of_index, ising_energy, normalize_ising,
+)
 
 
 def make_instance(n, seed):
@@ -99,6 +101,28 @@ def test_exact_energy_matches_brute_force(algo):
     res = algo.solve(h, J, layers=2, max_iter=30, seed=2)
     brute = min(ising_energy(s, h, J) for s in all_bitstrings(5))
     assert res["exact_energy"] == pytest.approx(brute, abs=1e-9)
+
+
+def test_normalize_ising_preserves_energy_ordering():
+    h, J = make_instance(5, seed=88)
+    hs, Js, scale = normalize_ising(h, J)
+    assert scale > 0.0
+    assert max(np.abs(hs).max(), np.abs(Js).max()) == pytest.approx(1.0)
+    original = np.array([ising_energy(s, h, J) for s in all_bitstrings(5)])
+    scaled = np.array([ising_energy(s, hs, Js) for s in all_bitstrings(5)])
+    np.testing.assert_allclose(scaled * scale, original, atol=1e-12)
+    assert int(np.argmin(scaled)) == int(np.argmin(original))
+
+
+def test_solve_accepts_explicit_warm_start_params(algo):
+    h, J = make_instance(4, seed=89)
+    params = np.array([0.12, 0.21])
+    result = algo.solve(
+        h, J, layers=1, max_iter=5, seed=1, initial_params=params)
+    assert result["best_params"].shape == (2,)
+    with pytest.raises(ValueError, match="initial_params"):
+        algo.solve(h, J, layers=1, max_iter=1,
+                   initial_params=np.array([0.1]))
 
 
 def test_exact_energy_min_matches_eigvalsh_n8(algo):
