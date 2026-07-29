@@ -31,7 +31,7 @@ import re
 import numpy as np
 import pandas as pd
 
-CACHE_DIR = "/mnt/f/Gaming/bs_cache_1year"
+CACHE_DIR = "bs_cache_1year"
 
 
 def _normalize_code(code: str) -> str:

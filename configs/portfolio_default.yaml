@@ -32,10 +32,11 @@ universe:
     - {code: "us_TSLA", name: Tesla}
 
 data:
-  stock_cache_dir: ../bs_cache_1year
-  benchmark_code: "510300"
-  # XAU当前只到该日，因此本轮共同截止日固定在2026-07-03。
-  as_of: "2026-07-03"
+  stock_cache_dir: bs_cache_1year
+  # 用沪深300指数而非510300 ETF：本地指数历史自2020年起，支持更长滚动窗口。
+  benchmark_code: "000300"
+  # XAU 已更新至 2026-07-26；回测仍会自动取所有数据源共同的最后交易日。
+  as_of: "2026-07-27"
   contract_files:
     XAU: data/crypto_daily/XAU_USDT_1d.csv
 
@@ -133,6 +134,8 @@ rebalance:
   signal_at_close: true
   execution_delay_days: 1
   max_turnover_per_rebalance: 0.20
+  # 单边换手：0.5 * sum(abs(w_t - w_{t-1}))；首期从现金建仓也计入。
+  turnover_definition: one_way_weight_turnover
 
 backtest:
   mode: trend_only_simplified
