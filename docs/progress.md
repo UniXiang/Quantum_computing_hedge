@@ -1,10 +1,26 @@
 # SDD Progress Ledger — quantum_hedge
 
-## 当前状态（2026-07-27）
+## 当前状态（2026-07-28）
 - **本地**：T3.3 实现完成，95 passed + 1 skipped；尚未提交
 - **壁仞远端**：T3.2 代码 79 passed + 7 skipped in 17.85s；T3.3 尚未同步
 - **当前 Task**：T3.3 壁仞 n=24 跑数完成；待决定是否用 INTERP 重跑 p=2/4
 - **计划调整**：主结果固定为 n=24；n=28 不再作为验收项，仅保留为后续资源外推
+
+Task 5: walk-forward backtest first run complete
+- 新增 `src/backtest.py`：周末信号、下一 A 股交易日执行、严格按合约实际最后
+  观测日截断的价格方向回测；每次运行输出逐日净值、调仓审计表、绩效指标 CSV、
+  自动量化评价 `report.md` 与净值/回撤图 `performance.png`
+- 离散层将上一期二进制选择传给现有 variable-cardinality QUBO 的换手项；连续层
+  落实单边换手 `0.5*sum(abs(delta weight)) <= 20%`。为保证硬约束可行，未再被
+  选中的旧仓只能临时减持、不得加仓
+- 当前主回测改用沪深300指数 `000300`（历史自2020年；替代仅有2026年历史的
+  510300 ETF），并新增配置资产历史完整性保护：美股数据开始前不得以0收益伪造
+  信号。样本延长至2025-11-03至2026-07-24，共37次调仓、177个持有日。
+- 扩展 SA 回测：策略累计17.00%，沪深300指数0.18%，最大回撤-7.63%，实现beta
+  0.600；候选18股等权42.49%，因此不能将本轮结果描述为优于该简单基准
+- 详细口径和结果：`docs/backtest_sa_csi300_index_2026-07-24.md`；CSV：
+  `results/backtest_sa_csi300_index/{daily_returns,rebalances,metrics}.csv`
+- 验证：全仓 `110 passed, 1 skipped`
 
 Task 4.1: real n=24 pipeline and Biren p=1 QAOA complete
 - 2026-07-28配置替换为：11只指定A股 + 7只 `us_*` 美股构成18个

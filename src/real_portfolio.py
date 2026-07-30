@@ -118,15 +118,47 @@ def load_market_inputs(config: dict[str, Any]) -> MarketInputs:
     as_of = str(data["as_of"])
     preferred = int(objective["preferred_window"])
     benchmark = str(data["benchmark_code"]).zfill(6)
-    stock_and_benchmark = load_returns(
-        mainland_codes + [benchmark], as_of, preferred,
-        cache_dir=str(data["stock_cache_dir"]),
-    )
-    calendar = stock_and_benchmark.index
-    base = stock_and_benchmark[mainland_codes].copy()
+    # Use the benchmark's *observed* sessions as the signal calendar.  The
+    # general-purpose loader fills missing asset sessions with zero returns,
+    # which is appropriate for a suspended constituent but not for a
+    # benchmark whose history simply begins later.  Taking this calendar
+    # directly prevents artificial pre-inception benchmark zeroes.
+    cache_dir = str(data["stock_cache_dir"])
+    benchmark_return = _load_one(benchmark, cache_dir)
+    calendar = benchmark_return.loc[benchmark_return.index <= as_of].index
+    if not len(calendar):
+        raise ValueError(f"no benchmark sessions available on or before {as_of}")
+
+    # A return of zero is a valid representation of a suspension or holiday
+    # *after* an instrument enters the universe.  It is not a valid stand-in
+    # for the period before a configured asset has any history at all.  The
+    # latter would manufacture factors (and, for US names, NaN liquidity)
+    # when a longer benchmark history is enabled for backtesting.
+    availability_starts: list[str] = []
+    for code in equity_codes:
+        observed = _load_one(code, cache_dir)
+        observed = observed.loc[observed.index <= as_of]
+        if observed.empty:
+            raise ValueError(f"{code}: no history on or before {as_of}")
+        availability_starts.append(str(observed.index[0]))
+    for item in hedges:
+        if item["kind"] != "contract":
+            continue
+        symbol = _code(item)
+        if symbol not in data["contract_files"]:
+            raise ValueError(f"no contract CSV configured for {symbol}")
+        prices = _contract_prices(data["contract_files"][symbol], as_of)
+        if prices.empty:
+            raise ValueError(f"{symbol}: no prices on or before {as_of}")
+        availability_starts.append(str(prices.index[0]))
+    calendar = calendar[calendar >= max(availability_starts)]
+    calendar = calendar[-preferred:]
+    base = pd.DataFrame(index=calendar)
+    for code in mainland_codes:
+        base[code] = _load_one(code, cache_dir).reindex(calendar).fillna(0.0)
 
     for code in us_codes:
-        us_return = _load_one(code, str(data["stock_cache_dir"]))
+        us_return = _load_one(code, cache_dir)
         us_return = us_return.loc[us_return.index <= as_of]
         # A missing US session is a closed market (0); shift makes the
         # prior US close the latest known observation at A-share close.
@@ -146,15 +178,14 @@ def load_market_inputs(config: dict[str, Any]) -> MarketInputs:
         base[symbol] = aligned_prices.pct_change(fill_method=None)
 
     joined = base.join(
-        stock_and_benchmark[benchmark].rename("__benchmark__"),
-        how="inner",
+        benchmark_return.reindex(calendar).rename("__benchmark__"), how="inner",
     ).dropna()
     minimum = int(objective["min_common_observations"])
     if len(joined) < minimum:
         raise ValueError(
             f"only {len(joined)} common observations, need at least {minimum}")
     liquidity = _stock_liquidity(
-        equity_codes, as_of, preferred, str(data["stock_cache_dir"]))
+        equity_codes, as_of, min(preferred, len(calendar)), cache_dir)
     return MarketInputs(
         base_returns=joined[base.columns],
         benchmark_returns=joined["__benchmark__"],
@@ -252,6 +283,7 @@ def _market_betas(
 
 def build_real_qubo(
         inputs: MarketInputs, config: dict[str, Any],
+        previous_selection: np.ndarray | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, np.ndarray, dict[str, Any]]:
     """Create the n=24 QUBO and its auditable variable table."""
     candidates = config["universe"]["candidates"]
@@ -345,6 +377,8 @@ def build_real_qubo(
         lambda_downside=float(objective["downside_risk_weight"]),
         lambda_beta=float(objective["beta_penalty_weight"]),
         holding_cost=costs,
+        previous_selection=previous_selection,
+        lambda_turnover=float(objective["turnover_penalty_weight"]),
         mutually_exclusive=conflict_pairs,
         conflict_penalty=float(
             config["selection"]["direction_conflict_penalty"]),
@@ -367,6 +401,7 @@ def qubo_objective_terms(
         variables: pd.DataFrame,
         covariance: np.ndarray,
         config: dict[str, Any],
+        previous_selection: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Auditable decomposition of the variable-cardinality QUBO objective."""
     x = np.asarray(selected, dtype=np.float64)
@@ -394,6 +429,16 @@ def qubo_objective_terms(
     beta_term = (float(objective["beta_penalty_weight"])
                  * float(beta @ v - float(objective["beta_target"])) ** 2)
     holding = float(costs @ x)
+    turnover = 0.0
+    turnover_constant = 0.0
+    if previous_selection is not None:
+        previous = np.asarray(previous_selection, dtype=np.float64)
+        if previous.shape != x.shape or not np.all(np.isin(previous, (0.0, 1.0))):
+            raise ValueError("previous_selection must be binary and match selected")
+        turnover = (float(objective["turnover_penalty_weight"])
+                    * float(np.abs(x - previous).sum()))
+        turnover_constant = (float(objective["turnover_penalty_weight"])
+                             * float(previous.sum()))
     constant = (float(objective["beta_penalty_weight"])
                 * float(objective["beta_target"]) ** 2)
     return {
@@ -402,9 +447,11 @@ def qubo_objective_terms(
         "beta_penalty": beta_term,
         "holding_cost": holding,
         "direction_conflict": conflict,
-        "full_objective": risk + reward + beta_term + holding + conflict,
+        "selection_turnover": turnover,
+        "full_objective": risk + reward + beta_term + holding + turnover + conflict,
         "qubo_energy_without_constant": (
-            risk + reward + beta_term + holding + conflict - constant),
+            risk + reward + beta_term + holding + turnover + conflict
+            - constant - turnover_constant),
     }
 
 
@@ -413,13 +460,35 @@ def allocate_selected_weights(
         variables: pd.DataFrame,
         covariance: np.ndarray,
         config: dict[str, Any],
+        previous_weights: np.ndarray | None = None,
+        max_turnover: float | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Continuous SLSQP allocation on the QUBO-selected subset."""
     selected = np.asarray(selected, dtype=np.int64)
-    active = np.flatnonzero(selected)
+    if previous_weights is None:
+        previous = np.zeros(len(selected), dtype=np.float64)
+    else:
+        previous = np.asarray(previous_weights, dtype=np.float64)
+        if previous.shape != (len(selected),) or not np.all(np.isfinite(previous)):
+            raise ValueError("previous_weights must be finite and match selected")
+    if max_turnover is not None and max_turnover < 0.0:
+        raise ValueError("max_turnover must be non-negative")
+    # A hard trading cap means a newly selected target cannot always replace
+    # every old holding immediately.  Retain old non-selected positions as
+    # "carry" variables with a zero-to-current-weight bound; they can only
+    # be reduced, never increased.  This makes the executed portfolio a
+    # feasible path from the previous one while keeping the QUBO selection
+    # visible as the desired target set.
+    selected_active = np.flatnonzero(selected)
+    carry_active = np.flatnonzero((np.abs(previous) > 1e-12) & ~selected.astype(bool))
+    active = np.union1d(selected_active, carry_active)
     if not len(active):
+        turnover = 0.5 * float(np.abs(previous).sum())
+        if max_turnover is not None and turnover > max_turnover + 1e-10:
+            raise RuntimeError("turnover cap makes the empty allocation infeasible")
         return np.zeros(len(selected)), {
             "gross_exposure": 0.0, "net_exposure": 0.0, "portfolio_beta": 0.0,
+            "turnover": turnover,
         }
     table = variables.iloc[active]
     signs = table["sign"].to_numpy(dtype=np.float64)
@@ -434,7 +503,12 @@ def allocate_selected_weights(
         float(allocation["max_contract_abs_weight"]),
     )
     minimum_weight = float(allocation.get("min_selected_weight", 0.0))
-    bounds = [(minimum_weight, float(cap)) for cap in caps]
+    selected_mask = selected[active].astype(bool)
+    bounds = [
+        ((minimum_weight if is_selected else 0.0),
+         float(cap if is_selected else min(cap, abs(previous[index]))))
+        for index, cap, is_selected in zip(active, caps, selected_mask, strict=True)
+    ]
 
     lower_net = float(allocation["min_net_exposure"])
     upper_net = float(allocation["max_net_exposure"])
@@ -457,6 +531,15 @@ def allocate_selected_weights(
         {"type": "ineq", "fun": lambda w: upper_net - signs @ w},
         {"type": "ineq", "fun": lambda w: max_gross - w.sum()},
     ]
+    inactive_previous_abs = float(np.abs(previous[np.setdiff1d(
+        np.arange(len(selected)), active)]).sum())
+    if max_turnover is not None:
+        def turnover_slack(magnitudes: np.ndarray) -> float:
+            signed = signs * magnitudes
+            active_turnover = np.abs(signed - previous[active]).sum()
+            return float(max_turnover - 0.5 * (active_turnover + inactive_previous_abs))
+
+        constraints.append({"type": "ineq", "fun": turnover_slack})
     initial = np.minimum(caps, np.where(signs > 0.0, 0.06, 0.02))
     result = minimize(
         loss,
@@ -470,21 +553,27 @@ def allocate_selected_weights(
         raise RuntimeError(f"continuous allocation failed: {result.message}")
     weights = np.zeros(len(selected), dtype=np.float64)
     weights[active] = signs * result.x
+    turnover = 0.5 * float(np.abs(weights - previous).sum())
     diagnostics = {
         "gross_exposure": float(np.abs(weights).sum()),
         "net_exposure": float(weights.sum()),
         "portfolio_beta": float(beta @ result.x),
         "objective": float(result.fun),
+        "turnover": turnover,
     }
     return weights, diagnostics
 
 
 def solve_real_portfolio(
         config: dict[str, Any],
+        previous_selection: np.ndarray | None = None,
+        previous_weights: np.ndarray | None = None,
+        enforce_turnover_cap: bool = False,
 ) -> dict[str, Any]:
     """Run the deterministic SA baseline and continuous allocation."""
     inputs = load_market_inputs(config)
-    Q, variables, covariance, meta = build_real_qubo(inputs, config)
+    Q, variables, covariance, meta = build_real_qubo(
+        inputs, config, previous_selection=previous_selection)
     qaoa_config = config["qaoa"]
     selected, energy = solve_sa(
         Q,
@@ -493,11 +582,16 @@ def solve_real_portfolio(
         n_restarts=8,
     )
     weights, allocation = allocate_selected_weights(
-        selected, variables, covariance, config)
+        selected, variables, covariance, config,
+        previous_weights=previous_weights,
+        max_turnover=(float(config["rebalance"]["max_turnover_per_rebalance"])
+                      if enforce_turnover_cap else None))
     h, J, offset = qubo_to_ising(Q)
     output = variables.copy()
     output["selected"] = selected.astype(bool)
     output["weight"] = weights
+    output["carried"] = (~output["selected"]
+                         & (np.abs(output["weight"]) > 1e-12))
     return {
         "inputs": inputs,
         "Q": Q,
@@ -509,5 +603,6 @@ def solve_real_portfolio(
         "meta": meta,
         "allocation": allocation,
         "objective_terms": qubo_objective_terms(
-            selected, variables, covariance, config),
+            selected, variables, covariance, config,
+            previous_selection=previous_selection),
     }

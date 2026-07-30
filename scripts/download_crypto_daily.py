@@ -24,9 +24,10 @@ PROXIES = {"http": PROXY_URL, "https": PROXY_URL}
 SYMBOLS = {
     "BTC": "BTC-USDT-SWAP",
     "CL": "CL-USDT-SWAP",
+    "XAU": "XAU-USDT-SWAP",
 }
 BAR = "1D"
-DAYS = 365
+DAYS = 365 * 6  # 6年，API能返回多少就取多少
 OUTPUT_DIR = Path("/mnt/f/Gaming/quantum_hedge/data/crypto_daily")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

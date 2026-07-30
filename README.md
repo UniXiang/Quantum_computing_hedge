@@ -120,6 +120,16 @@ python src/run_real_portfolio.py
 python src/run_real_qaoa.py
 ```
 
+### 运行滚动回测
+
+```bash
+python src/backtest.py --output-dir results/backtest_sa
+```
+
+每次运行除 CSV 明细外，还会在输出目录生成 `performance.png`（策略、沪深300、
+候选等权的净值和回撤曲线）及 `report.md`（风险收益、相对基准、换手和口径边界
+的自动量化评价）。
+
 ---
 
 ## 实验进度
@@ -132,7 +142,7 @@ python src/run_real_qaoa.py
 | T3.2 | complex64 + checkpoint + 壁仞适配 | ✅ |
 | T3.3 | 壁仞 n=24 实验 | ✅ 命中基态 |
 | T4 | 金融 pipeline（真实 n=24） | 🟡 壁仞 p=1 命中基态，SA 保留兜底 |
-| T5 | 回测 | ⬜ |
+| T5 | 回测 | 🟡 首轮 SA 滚动价格方向回测已完成；待扩展样本与稳健性检验 |
 
 > 详细进度见 [`docs/progress.md`](docs/progress.md)
 
