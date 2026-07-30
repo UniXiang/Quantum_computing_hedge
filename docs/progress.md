@@ -1,43 +1,12 @@
 # SDD Progress Ledger — quantum_hedge
 
-## 当前状态（2026-07-28）
+## 当前状态（2026-07-27）
 - **本地**：T3.3 实现完成，95 passed + 1 skipped；尚未提交
 - **壁仞远端**：T3.2 代码 79 passed + 7 skipped in 17.85s；T3.3 尚未同步
 - **当前 Task**：T3.3 壁仞 n=24 跑数完成；待决定是否用 INTERP 重跑 p=2/4
 - **计划调整**：主结果固定为 n=24；n=28 不再作为验收项，仅保留为后续资源外推
 
-Task 5: walk-forward backtest first run complete
-- 新增 `src/backtest.py`：周末信号、下一 A 股交易日执行、严格按合约实际最后
-  观测日截断的价格方向回测；每次运行输出逐日净值、调仓审计表、绩效指标 CSV、
-  自动量化评价 `report.md` 与净值/回撤图 `performance.png`
-- 离散层将上一期二进制选择传给现有 variable-cardinality QUBO 的换手项；连续层
-  落实单边换手 `0.5*sum(abs(delta weight)) <= 20%`。为保证硬约束可行，未再被
-  选中的旧仓只能临时减持、不得加仓
-- 当前主回测改用沪深300指数 `000300`（历史自2020年；替代仅有2026年历史的
-  510300 ETF），并新增配置资产历史完整性保护：美股数据开始前不得以0收益伪造
-  信号。样本延长至2025-11-03至2026-07-24，共37次调仓、177个持有日。
-- 扩展 SA 回测：策略累计17.00%，沪深300指数0.18%，最大回撤-7.63%，实现beta
-  0.600；候选18股等权42.49%，因此不能将本轮结果描述为优于该简单基准
-- 详细口径和结果：`docs/backtest_sa_csi300_index_2026-07-24.md`；CSV：
-  `results/backtest_sa_csi300_index/{daily_returns,rebalances,metrics}.csv`
-- 验证：全仓 `110 passed, 1 skipped`
-
-Task 4.1: real n=24 pipeline and Biren p=1 QAOA complete
-- 2026-07-28配置替换为：11只指定A股 + 7只 `us_*` 美股构成18个
-  long-only alpha；农业银行、贵州茅台、药明康德、东方财富各一个long变量，
-  加XAU long/short构成6个对冲变量
-- 美股缓存支持已加入 `data_loader`；美股当日收盘晚于A股，信号构建时严格
-  滞后一条A股交易日，避免时区导致的未来函数
-- 新窗口为119个A股交易日、57个基准下跌日；新SA/精确最优能量
-  `-0.361293309252285`，选7个alpha加药明康德对冲，连续层总/净敞口40%，
-  beta=0.5922
-- A/B/C改进已落地：保存最佳QAOA参数、显式warm-start p=2、p=1多种子与
-  top-65536、Ising正比例缩放与目标分项诊断、每个实验run写断点JSON
-- 壁仞新p=1（seed42，60 iter × 3内部重启）在1684.95秒命中精确基态，
-  gap=0；p=2路径已实现但因p=1已达全局最优而停止冗余运行
-- 详细报告：`docs/real_portfolio_us_2026-07-03.md`；结果：
-  `results/real_portfolio_us_2026-07-03.json`、
-  `results/real_n24_us_qaoa_abc.json`
+Task 4.1: real n=24 classical pipeline complete; Biren QAOA pending
 - 用户确认配置：持仓数量不固定；其余采用默认方案
   R1-D1-H(OKX多空)-B1-W1-T1-S1-M1
 - 24变量新分配：18只股票决赛候选 + BTC/CL/XAU各long/short两个方向；
@@ -65,14 +34,6 @@ Task 4.1: real n=24 pipeline and Biren p=1 QAOA complete
 - 输出：`results/real_portfolio_2026-07-03.json`；
   `results/real_n24_instance.npz` 可直接送壁仞，不需要上传私人行情缓存
 - 本地全仓验证更新为104 passed + 1 skipped
-- 壁仞真实p=1：complex64、adjoint、checkpoint、20 iter、top-4096，
-  优化558.1s，总QAOA 563.2s；采样QUBO能量-0.3709063932，
-  全局最优-0.3798642749，absolute gap=0.0089578817，未命中基态
-- QAOA解在全部2^24状态中排名约1036（前0.0062%），选7只股票且
-  无对冲方向；全局最优bitstring不在QAOA top-4096
-- 按既定 `QAOA + SA fallback` 规则，最终采用SA命中的全局最优
-  8股+BTC/CL/XAU三条short，而不采用本次QAOA样本
-- 壁仞结果已取回：`results/real_n24_qaoa.{json,log}`
 
 Task 3.3: experiment complete (n=24; mixed QAOA result)
 - 交付：`validate_n24_n28.py`（确定性合成因子收益组合实例、e_vec跨p复用、

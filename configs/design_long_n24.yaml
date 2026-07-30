@@ -1,0 +1,94 @@
+universe:
+  finalists: 21
+  max_per_market: 12
+  max_per_sector: 4
+  a_share_candidates:
+    - {code: "300308", name: 中际旭创, sector: 科技}
+    - {code: "002475", name: 立讯精密, sector: 科技}
+    - {code: "300502", name: 新易盛, sector: 科技}
+    - {code: "603986", name: 兆易创新, sector: 半导体}
+    - {code: "688981", name: 中芯国际, sector: 半导体}
+    - {code: "300750", name: 宁德时代, sector: 新能源}
+    - {code: "601869", name: 长飞光纤, sector: 通信}
+    - {code: "000725", name: 京东方A, sector: 电子}
+    - {code: "600487", name: 亨通光电, sector: 通信}
+    - {code: "000938", name: 紫光股份, sector: 科技}
+    - {code: "000977", name: 浪潮信息, sector: 科技}
+    - {code: "603259", name: 药明康德, sector: 医疗健康}
+    - {code: "300255", name: 常山药业, sector: 医疗健康}
+    - {code: "300136", name: 信维通信, sector: 电子}
+    - {code: "601100", name: 恒立液压, sector: 工业}
+    - {code: "688017", name: 绿的谐波, sector: 工业}
+    - {code: "002185", name: 华天科技, sector: 半导体}
+    - {code: "002371", name: 北方华创, sector: 半导体}
+  us_candidates:
+    - {code: MU, name: Micron Technology, sector: AI半导体}
+    - {code: INTC, name: Intel, sector: AI半导体}
+    - {code: AMD, name: AMD, sector: AI半导体}
+    - {code: TSM, name: Taiwan Semiconductor, sector: AI半导体}
+    - {code: ASML, name: ASML Holding, sector: AI半导体}
+    - {code: MRVL, name: Marvell Technology, sector: AI半导体}
+    - {code: ARM, name: Arm Holdings, sector: AI半导体}
+    - {code: GOOGL, name: Alphabet, sector: AI应用}
+    - {code: MSFT, name: Microsoft, sector: AI应用}
+    - {code: AMZN, name: Amazon, sector: AI应用}
+    - {code: META, name: Meta Platforms, sector: AI应用}
+    - {code: PANW, name: Palo Alto Networks, sector: 网络安全}
+    - {code: BAC, name: Bank of America, sector: 金融}
+    - {code: HAL, name: Halliburton, sector: 能源}
+    - {code: NEE, name: NextEra Energy, sector: 公用事业}
+    - {code: ICE, name: Intercontinental Exchange, sector: 金融}
+    - {code: NOC, name: Northrop Grumman, sector: 国防}
+    - {code: LLY, name: Eli Lilly, sector: 医疗健康}
+
+data:
+  cache_dir: data/bs_cache_1year
+  as_of: "2026-07-03"
+  decision_time: "2026-07-04T08:00:00+08:00"
+  contract_files:
+    BTC: data/crypto_daily/BTC_USDT_1d.csv
+    CL: data/crypto_daily/CL_USDT_1d.csv
+    XAU: data/crypto_daily/XAU_USDT_1d.csv
+
+preselection:
+  factors:
+    momentum: 0.35
+    downside_adjusted_return: 0.30
+    low_volatility: 0.20
+    liquidity: 0.15
+  momentum_windows: [20, 40, 60]
+
+objective:
+  window: 60
+  annualization: 252
+  expected_return_weight: 0.35
+  downside_risk_weight: 1.0
+  expected_return_prior_observations: 1008
+  expected_return_clip: [-0.30, 0.30]
+  target_holdings: 8
+  cardinality_penalty_multiplier: 12.0
+  turnover_penalty: 0.01
+
+allocation:
+  min_selected_weight: 0.02
+  max_stock_weight: 0.25
+  max_alternative_weight: 0.35
+  full_investment: 1.0
+
+qaoa:
+  layers: 2
+  init: interp
+  dtype: complex64
+  adjoint: true
+  checkpoint: true
+  top_k: 4096
+  max_iter: 15
+  seed: 42
+  sa_budget_seconds: 5.0
+
+backtest:
+  start: "2026-05-20"
+  end: "2026-06-29"
+  decision_time_local: "08:00:00+08:00"
+  transaction_cost_bps: 15.0
+  initial_nav: 1.0

@@ -218,6 +218,69 @@ def build_flexible_selection_qubo(
     return np.asarray((Q + Q.T) / 2.0, dtype=np.float64)
 
 
+def build_weighted_cardinality_qubo(
+        expected_returns: np.ndarray,
+        downside_covariance: np.ndarray,
+        *,
+        target_holdings: int,
+        lambda_return: float = 1.0,
+        lambda_downside: float = 1.0,
+        cardinality_penalty: float = 1.0,
+        previous_selection: np.ndarray | None = None,
+        lambda_turnover: float = 0.0) -> np.ndarray:
+    """Build a long-or-cash, fixed-cardinality portfolio QUBO.
+
+    Every binary variable represents one asset: ``x_i=1`` means long and
+    ``x_i=0`` means the asset is absent.  The quantum-stage portfolio uses
+    equal proxy weights ``w=x/K`` so the objective remains exactly quadratic::
+
+        lambda_downside * w' Sigma_down w
+        - lambda_return * mu' w
+        + A * (sum(x)-K)^2
+        + lambda_turnover * |x-previous_selection|
+
+    The constant ``A*K^2`` and the constant part of turnover are omitted.
+    A later classical allocator may refine weights inside the selected set,
+    but it must keep the same long-only and full-investment semantics.
+    """
+    mu = np.asarray(expected_returns, dtype=np.float64)
+    covariance = np.asarray(downside_covariance, dtype=np.float64)
+    if mu.ndim != 1:
+        raise ValueError("expected_returns must be 1-D")
+    n = len(mu)
+    if covariance.shape != (n, n):
+        raise ValueError(
+            f"downside_covariance must have shape ({n}, {n}), got "
+            f"{covariance.shape}")
+    if not np.allclose(covariance, covariance.T, atol=1e-12):
+        raise ValueError("downside_covariance must be symmetric")
+    if not (1 <= int(target_holdings) <= n):
+        raise ValueError(
+            f"target_holdings must satisfy 1 <= K <= {n}, got "
+            f"{target_holdings}")
+    if cardinality_penalty <= 0.0:
+        raise ValueError("cardinality_penalty must be positive")
+    K = int(target_holdings)
+    Q = (
+        float(lambda_downside) * covariance / (K * K)
+        - np.diag(float(lambda_return) * mu / K)
+    )
+    # A(sum x-K)^2, remembering that x_i^2=x_i and x'Qx counts
+    # symmetric off-diagonal terms twice.
+    A = float(cardinality_penalty)
+    Q += A * np.ones((n, n), dtype=np.float64)
+    np.fill_diagonal(Q, np.diag(Q) - 2.0 * A * K)
+
+    if previous_selection is not None:
+        previous = np.asarray(previous_selection, dtype=np.float64)
+        if previous.shape != (n,) or not np.all(np.isin(previous, (0, 1))):
+            raise ValueError(
+                f"previous_selection must be binary shape ({n},)")
+        diag = np.diag_indices(n)
+        Q[diag] += float(lambda_turnover) * (1.0 - 2.0 * previous)
+    return np.asarray((Q + Q.T) / 2.0, dtype=np.float64)
+
+
 def build_qubo(returns: pd.DataFrame, K: int, lam: float, A: float,
                gamma: float = 0.0,
                x_prev: np.ndarray | None = None) -> np.ndarray:

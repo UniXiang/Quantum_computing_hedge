@@ -1,162 +1,56 @@
-# Quantum Hedge — 量子组合优化对冲策略
+# Quantum Hedge
 
-> **ai4sci 比赛项目** · 国产 GPU（壁仞 Biren106M）量子计算赛道  
-> A 股 alpha 池 + 对冲工具 beta池 → 下行半方差 QUBO → Ising 编码 → QAOA 离散选择 → 经典权重分配 → 日频回测
+跨 A 股、美股、黄金、原油和比特币的量子近似组合优化研究项目。
 
----
+## 当前能力
 
-## 架构一览
+- 1 个资产对应 1 个量子比特：`1=做多`，`0=不持有`
+- 不做空，离散选择后执行连续满仓权重优化
+- 固定汉明重量 Dicke 初态与环形 XY mixer
+- QAOA、模拟退火和精确枚举基准
+- walk-forward 跨市场回测
+- top-K 候选连续权重重优化
+- p=1–4、多种子与 CVaR 实验
+- SA warm-start QAOA
+- n=24、28、30、32 且 K=8 的规模实验
+- n=32 下 K=4–9 的持仓数量搜索
 
-```
-Alpha 池 (A股因子) ─┐
-                     ├─→ 条件下行协方差 QUBO ─→ Ising 编码 ─→ QAOA ─→ 离散持仓选择 ─→ SLSQP 连续权重 ─→ 回测
-Beta 池 (对冲工具)  ─┘                              ↑
-                                              壁仞 Biren106M
-                                              (unitarylab + torch)
-```
+## 主要目录
 
-**核心思路：** 用量子近似优化算法（QAOA）在 24~28 变量的组合空间中搜索最优离散持仓，在控制下行风险的同时实现 Beta ≈ 0.6 的对冲目标。
-
----
-
-## 关键特性
-
-| 特性 | 说明 |
-|---|---|
-| **量子核** | 自研 `IsingQAOA` 模块，支持 autograd / 伴随反传 / complex64 / gradient checkpointing / INTERP 热启动 |
-| **QUBO 建模** | 条件下行协方差矩阵 + 可变持仓惩罚 + 多空互斥 + Beta 偏差 + 软持仓成本 + 换手约束 |
-| **双轨求解** | QAOA（壁仞 GPU） + Simulated Annealing（本地 CPU）双保险，QAOA 未达全局最优时 SA 兜底 |
-| **真实数据管线** | 指定 A 股 + 美股 + BTC/XAU/CL 期货数据，严格截断无未来函数 |
-| **跨平台** | 本地 WSL2 开发，壁仞 Biren106M 32GB 远端执行 |
-| **全链路验证** | 104 passed + 1 skipped（本地），比特序 & Ising 能量约定钉死测试 |
-
----
-
-## 项目结构
-
-```
-quantum_hedge/
-├── README.md                       ← 本文档
-├── configs/
-│   └── portfolio_default.yaml      ← 组合默认配置
-├── docs/
-│   ├── progress.md                 ← 进度台账
-│   └── 2026-07-25-*-design.md      ← 设计文档
-├── src/
-│   ├── ising_qaoa.py               ← 量子核：IsingQAOA
-│   ├── qubo_builder.py             ← QUBO 构建器
-│   ├── data_loader.py              ← 日线数据加载
-│   ├── real_portfolio.py           ← 真实组合 pipeline
-│   ├── run_real_portfolio.py       ← 18股+3合约组合 CLI
-│   ├── run_real_qaoa.py            ← QAOA 入口（壁仞）
-│   ├── solvers.py                  ← 经典基线（穷举 + SA）
-│   └── validate_n24_n28.py         ← n=24/28 验证
-├── tests/                          ← 104 + 1 测试用例
-├── scripts/                        ← 远端运行 & 数据下载脚本
-├── data/
-│   └── crypto_daily/               ← BTC / XAU / CL 日线
-├── results/                        ← 实验结果 JSON / log
-└── third_party/                    ← unitarylab vendor 副本（不动源码）
+```text
+configs/   投资组合与 QAOA 参数
+docs/      设计文档和进展记录
+scripts/   数据准备和远端 GPU 运行脚本
+src/       QUBO、QAOA、SA、回测和报告实现
+tests/     单元测试与集成测试
 ```
 
----
+市场数据、缓存、运行结果和本地环境文件不会提交到仓库。
 
-## 环境要求
-
-### 本地（WSL2 开发）
-
-| 组件 | 版本 |
-|---|---|
-| Python | 3.12 |
-| torch | —（本地仅 CPU 验证） |
-| unitarylab | ✅ |
-| pytest / numpy / scipy / sklearn | ✅ |
-
-### 远端（壁仞 Biren106M 执行）
-
-| 组件 | 版本 |
-|---|---|
-| Python | 3.10 |
-| torch | 2.9.0+cu128 |
-| unitarylab | 1.0.0 |
-| SDK | birensupa 1.11.0.0.rc2 |
-
----
-
-## 快速开始
-
-### 本地测试
+## 本地测试
 
 ```bash
-# 安装依赖
-pip install pytest numpy scipy scikit-learn
-
-# 跑全量测试
-python -m pytest tests/ -v
+python -m pytest -q
 ```
 
-### 远端执行
+## 主要实验入口
 
 ```bash
-# 1. 同步代码到壁仞
-rsync -avz --exclude='third_party' --exclude='.git' --exclude='data' \
-      --exclude='.superpowers' --exclude='results' --exclude='__pycache__' \
-      -e "sshpass -e ssh" \
-      /mnt/f/Gaming/quantum_hedge/ biren:/workspace/quantum/quantum_hedge/
+PYTHONPATH=src python src/prepare_fixed_k_scale.py \
+  --config configs/design_long_n24.yaml \
+  --n 32 --K 8 --output-dir results/fixed_k_scale/n32
 
-# 2. SSH 登录并执行
-sshpass -e ssh biren
-source /usr/local/birensupa/sdk/1.11.0.0.rc2/scripts/brsw_set_env.sh
-python -m pytest tests/ -v
+PYTHONPATH=src python src/run_fixed_k_warm_qaoa.py \
+  --instance results/fixed_k_scale/n32/instance.npz \
+  --context results/fixed_k_scale/n32/context.json \
+  --output results/fixed_k_scale/n32/result.json \
+  --device cpu
 ```
 
-### 运行真实组合
+壁仞 GPU 环境使用 `--device biren`，并需事先加载对应 SUPA SDK。
 
-```bash
-# 本地 SA 基线 + QUBO 构建
-python src/run_real_portfolio.py
+## 重要说明
 
-# 壁仞 QAOA 求解
-python src/run_real_qaoa.py
-```
-
-### 运行滚动回测
-
-```bash
-python src/backtest.py --output-dir results/backtest_sa
-```
-
-每次运行除 CSV 明细外，还会在输出目录生成 `performance.png`（策略、沪深300、
-候选等权的净值和回撤曲线）及 `report.md`（风险收益、相对基准、换手和口径边界
-的自动量化评价）。
-
----
-
-## 实验进度
-
-| Task | 内容 | 状态 |
-|---|---|---|
-| T1 | IsingQAOA 量子核 | ✅ |
-| T2 | QUBO + SA + n=16 验证 | ✅ |
-| T3.1 | e_vec 分块 + INTERP 热启动 | ✅ |
-| T3.2 | complex64 + checkpoint + 壁仞适配 | ✅ |
-| T3.3 | 壁仞 n=24 实验 | ✅ 命中基态 |
-| T4 | 金融 pipeline（真实 n=24） | 🟡 壁仞 p=1 命中基态，SA 保留兜底 |
-| T5 | 回测 | 🟡 首轮 SA 滚动价格方向回测已完成；待扩展样本与稳健性检验 |
-
-> 详细进度见 [`docs/progress.md`](docs/progress.md)
-
----
-
-## 关键约定
-
-- **比特序**：qubit 0 = LSB，自旋 z = 1 − 2x（全链路自洽）
-- **Ising 能量**：E(z) = Σ h_i·z_i + Σ_{i<j} J_ij·z_i·z_j（上三角计一次，J 对称零对角）
-- **无未来函数**：data_loader 和 qubo_builder 不得触碰 end_date 之后的数据
-- **不动 third_party/** 源码；不使用 `QAOAAlgorithm.run()`（基类入口已覆写）
-
----
-
-## License
-
-本项目为 ai4sci 比赛参赛作品。
+当前 GPU 运行属于量子线路模拟，不是真实量子硬件。SA warm-start QAOA
+能够把经典候选集中为高概率量子态，但不能据此宣称量子优势。研究结论应同时
+报告经典搜索成本、QAOA 调参成本、shots 命中率和精确/近似最优差距。
