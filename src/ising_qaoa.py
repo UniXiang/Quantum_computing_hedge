@@ -283,23 +283,6 @@ def bitstring_of_index(idx: int, n: int) -> str:
     return "".join(str((idx >> i) & 1) for i in range(n))
 
 
-def normalize_ising(h: np.ndarray, J: np.ndarray,
-                    method: str = "max_abs") -> tuple[np.ndarray, np.ndarray, float]:
-    """Uniformly rescale an Ising Hamiltonian without changing its minimizer.
-
-    A positive scale only re-parameterizes QAOA's cost angle ``gamma``. It
-    improves Adam's conditioning when local fields and couplings are much
-    smaller or larger than the default initialization scale. ``max_abs``
-    makes the largest absolute coefficient equal to one.
-    """
-    h = np.asarray(h, dtype=np.float64)
-    J = np.asarray(J, dtype=np.float64)
-    if method != "max_abs":
-        raise ValueError(f"unknown normalization method {method!r}")
-    scale = float(max(np.max(np.abs(h)), np.max(np.abs(J)), 1e-12))
-    return h / scale, J / scale, scale
-
-
 class IsingQAOA(QAOAAlgorithm):
     """QAOA solver for general weighted Ising models with local fields."""
 
@@ -621,8 +604,7 @@ class IsingQAOA(QAOAAlgorithm):
               checkpoint: bool = False, adjoint: bool = False,
               final_backend: str = "auto",
               energy_vector: np.ndarray | None = None,
-              top_k: int = TOP_K,
-              initial_params: np.ndarray | None = None) -> dict:
+              top_k: int = TOP_K) -> dict:
         """Solve a weighted Ising model with QAOA.
 
         Parameters:
@@ -677,11 +659,6 @@ class IsingQAOA(QAOAAlgorithm):
                 default remains 16; cardinality-postselected experiments
                 may request a larger pool without transferring the full
                 probability vector to host.
-            initial_params: optional explicit parameter vector of shape
-                ``(2*layers,)``. When supplied it is optimized as one
-                warm-start trajectory rather than drawing random restarts.
-                This supports a true p=1 -> p=2 INTERP continuation across
-                separate experiment processes.
 
         Returns:
             dict with keys: bitstrings (top-K bitstring -> probability),
@@ -691,8 +668,7 @@ class IsingQAOA(QAOAAlgorithm):
             vector, no dense diagonalization), energy_history (all
             restarts and, for init='interp', all levels concatenated in
             training order), n_qubits, layers, device, optimizer, dtype,
-            checkpoint, adjoint, final_backend, best_params (the parameter
-            vector producing the final sampled distribution).
+            checkpoint, adjoint, final_backend.
         """
         h, J, n = self._validate(h, J, optimizer)
         if init not in ("random", "interp"):
@@ -707,14 +683,6 @@ class IsingQAOA(QAOAAlgorithm):
                 f"of ['auto', 'native', 'unitarylab']")
         if not isinstance(top_k, (int, np.integer)) or top_k < 1:
             raise ValueError(f"top_k must be a positive integer, got {top_k}")
-        if initial_params is not None:
-            initial_params = np.asarray(initial_params, dtype=np.float64)
-            if initial_params.shape != (2 * layers,):
-                raise ValueError(
-                    f"initial_params must have shape ({2 * layers},), got "
-                    f"{initial_params.shape}")
-            if not np.all(np.isfinite(initial_params)):
-                raise ValueError("initial_params must be finite")
         cdtype, rdtype = _PRECISION[dtype]
         tdevice = resolve_device(device)
         udevice = _UNITARYLAB_DEVICE.get(str(device).lower(), device)
@@ -758,9 +726,7 @@ class IsingQAOA(QAOAAlgorithm):
                 energy_history, e_vec=e_vec)
             return params, energy_history[-1]
 
-        if initial_params is not None:
-            final_params, final_exp = train_level(initial_params, layers)
-        elif init == "interp":
+        if init == "interp":
             # p=1: same seeded restarts as the random path.
             final_params, best_exp = None, np.inf
             for _ in range(N_RESTARTS):
@@ -858,5 +824,4 @@ class IsingQAOA(QAOAAlgorithm):
             "checkpoint": checkpoint,
             "adjoint": adjoint,
             "final_backend": chosen_final_backend,
-            "best_params": np.asarray(final_params, dtype=np.float64),
         }

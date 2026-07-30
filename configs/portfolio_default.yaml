@@ -1,8 +1,8 @@
 # Quantum Hedge — 用户确认的第一版真实组合配置（2026-07-27）
 #
-# 目标：18个 long-only alpha（11只A股 + 7只美股）和6个对冲变量
-# （4只A股 long-only + XAU long/short）组成24-qubit QUBO。持仓数量
-# 不固定，QAOA只负责资产/方向选择，连续仓位由经典优化器分配。
+# 目标：500只股票经典漏斗 -> 18只股票决赛候选；与3个OKX合约的
+# long/short方向变量组成24-qubit QUBO。持仓数量不固定，QAOA只负责
+# 资产/方向选择，连续仓位由经典优化器分配。
 
 universe:
   stock_pool_size: 500
@@ -10,7 +10,7 @@ universe:
   exclude_suspended: true
   min_listing_days: 250
   min_average_turnover_cny: 50000000
-  # 用户直接指定的18个 alpha：11只A股 + 7只美股；全部只做多。
+  # 本轮由用户直接指定18只决赛候选，不再运行500→18漏斗。
   candidates:
     - {code: "300308", name: 中际旭创}
     - {code: "002475", name: 立讯精密}
@@ -19,25 +19,26 @@ universe:
     - {code: "688981", name: 中芯国际}
     - {code: "300750", name: 宁德时代}
     - {code: "601869", name: 长飞光纤}
-    - {code: "002371", name: 北方华创}
+    - {code: "000725", name: 京东方A}
+    - {code: "600487", name: 亨通光电}
+    - {code: "000938", name: 紫光股份}
+    - {code: "000977", name: 浪潮信息}
+    - {code: "603259", name: 药明康德}
+    - {code: "300255", name: 常山药业}
+    - {code: "300136", name: 信维通信}
     - {code: "601100", name: 恒立液压}
     - {code: "688017", name: 绿的谐波}
     - {code: "002185", name: 华天科技}
-    - {code: "us_AAPL", name: Apple}
-    - {code: "us_AMZN", name: Amazon}
-    - {code: "us_GOOGL", name: Alphabet}
-    - {code: "us_META", name: Meta}
-    - {code: "us_MSFT", name: Microsoft}
-    - {code: "us_NVDA", name: NVIDIA}
-    - {code: "us_TSLA", name: Tesla}
+    - {code: "002371", name: 北方华创}
 
 data:
-  stock_cache_dir: bs_cache_1year
-  # 用沪深300指数而非510300 ETF：本地指数历史自2020年起，支持更长滚动窗口。
-  benchmark_code: "000300"
-  # XAU 已更新至 2026-07-26；回测仍会自动取所有数据源共同的最后交易日。
-  as_of: "2026-07-27"
+  stock_cache_dir: ../bs_cache_1year
+  benchmark_code: "510300"
+  # XAU当前只到该日，因此本轮共同截止日固定在2026-07-03。
+  as_of: "2026-07-03"
   contract_files:
+    BTC: data/crypto_daily/BTC_USDT_1d.csv
+    CL: data/crypto_daily/CL_USDT_1d.csv
     XAU: data/crypto_daily/XAU_USDT_1d.csv
 
 preselection:
@@ -51,14 +52,12 @@ preselection:
   max_per_sector: 3
 
 hedges:
-  # 6个对冲变量：4只A股只做多，XAU可 long/short/off。
-  source: mixed
-  assets:
-    - {code: "601288", name: 农业银行, kind: equity, directions: [long]}
-    - {code: "600519", name: 贵州茅台, kind: equity, directions: [long]}
-    - {code: "603259", name: 药明康德, kind: equity, directions: [long]}
-    - {code: "300059", name: 东方财富, kind: equity, directions: [long]}
-    - {code: "XAU", name: XAU-USDT, kind: contract, directions: [long, short]}
+  source: okx
+  instruments:
+    - BTC-USDT-SWAP
+    - CL-USDT-SWAP
+    - XAU-USDT
+  directions: [long, short]
   mutually_exclusive_directions: true
 
 selection:
@@ -71,14 +70,13 @@ selection:
   min_stocks: 0
   max_stocks: 18
   min_hedge_contracts: 0
-  max_hedge_contracts: 5
+  max_hedge_contracts: 3
   stock_holding_cost: 0.01
   hedge_direction_holding_cost: 0.01
   direction_conflict_penalty: 2.0
   # 只是Hamiltonian中的选择尺度，并非最终仓位，也不是固定持仓数量。
   stock_proxy_exposure: 0.05
-  equity_hedge_proxy_exposure: 0.05
-  contract_hedge_proxy_exposure: 0.08
+  hedge_proxy_exposure: 0.08
 
 objective:
   return_model: price_multifactor
@@ -99,19 +97,11 @@ objective:
   min_benchmark_down_observations: 20
 
 qaoa:
-  layers: 2
+  layers: 1
   dtype: complex64
   adjoint: true
   checkpoint: true
-  # A: 更充分的p=1搜索；B: 最佳p=1参数插值为p=2 warm start。
-  p1_max_iter: 60
-  p1_seeds: [42, 137, 271]
-  p2_max_iter: 40
-  p2_seeds: [42, 137]
-  warm_start_jitter: 0.03
-  top_k: 65536
-  # C: 将Ising h/J按最大绝对系数缩放到[-1, 1]，不改变基态排序。
-  hamiltonian_normalization: max_abs
+  top_k: 4096
   require_direction_feasible: true
   fallback_solver: simulated_annealing
   sa_budget_seconds: 5.0
@@ -134,8 +124,6 @@ rebalance:
   signal_at_close: true
   execution_delay_days: 1
   max_turnover_per_rebalance: 0.20
-  # 单边换手：0.5 * sum(abs(w_t - w_{t-1}))；首期从现金建仓也计入。
-  turnover_definition: one_way_weight_turnover
 
 backtest:
   mode: trend_only_simplified

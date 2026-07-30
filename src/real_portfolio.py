@@ -18,7 +18,7 @@ import pandas as pd
 import yaml
 from scipy.optimize import minimize
 
-from data_loader import _file_for, _load_one, _normalize_code, load_returns
+from data_loader import _file_for, _normalize_code, load_returns
 from qubo_builder import (
     benchmark_downside_covariance,
     build_flexible_selection_qubo,
@@ -36,7 +36,6 @@ class MarketInputs:
     stock_liquidity: pd.Series
     as_of: str
     preferred_observations: int
-    equity_codes: tuple[str, ...] = ()
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -82,117 +81,45 @@ def _stock_liquidity(
     return pd.Series(result, dtype=np.float64)
 
 
-def _code(item: dict[str, Any]) -> str:
-    """Canonical cache/return label for one configured equity or contract."""
-    if item.get("kind") == "contract":
-        return str(item["code"]).upper()
-    return _normalize_code(str(item["code"]))
-
-
-def _hedge_assets(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Configured hedge assets; kept separate from the 18 alpha finalists."""
-    assets = config["hedges"].get("assets", [])
-    if not assets:
-        raise ValueError("hedges.assets must define the hedge variables")
-    return assets
-
-
 def load_market_inputs(config: dict[str, Any]) -> MarketInputs:
-    """Load all assets on the A-share signal calendar without look-ahead.
-
-    US cash equities close after the A-share close carrying the same calendar
-    date. Their return series is therefore shifted by one A-share session:
-    at A-share close ``t`` the newest US close used is from ``t-1``. US
-    holidays become a zero return before this shift, rather than deleting an
-    A-share signal date.
-    """
+    """Load stocks, benchmark, and contract returns on one A-share calendar."""
     data = config["data"]
     objective = config["objective"]
     candidates = config["universe"]["candidates"]
-    hedges = _hedge_assets(config)
-    equity_items = candidates + [
-        item for item in hedges if item["kind"] == "equity"]
-    equity_codes = [_code(item) for item in equity_items]
-    mainland_codes = [code for code in equity_codes if not code.startswith("us_")]
-    us_codes = [code for code in equity_codes if code.startswith("us_")]
+    codes = [str(item["code"]).zfill(6) for item in candidates]
     as_of = str(data["as_of"])
     preferred = int(objective["preferred_window"])
     benchmark = str(data["benchmark_code"]).zfill(6)
-    # Use the benchmark's *observed* sessions as the signal calendar.  The
-    # general-purpose loader fills missing asset sessions with zero returns,
-    # which is appropriate for a suspended constituent but not for a
-    # benchmark whose history simply begins later.  Taking this calendar
-    # directly prevents artificial pre-inception benchmark zeroes.
-    cache_dir = str(data["stock_cache_dir"])
-    benchmark_return = _load_one(benchmark, cache_dir)
-    calendar = benchmark_return.loc[benchmark_return.index <= as_of].index
-    if not len(calendar):
-        raise ValueError(f"no benchmark sessions available on or before {as_of}")
+    stock_and_benchmark = load_returns(
+        codes + [benchmark], as_of, preferred,
+        cache_dir=str(data["stock_cache_dir"]),
+    )
+    calendar = stock_and_benchmark.index
+    base = stock_and_benchmark[codes].copy()
 
-    # A return of zero is a valid representation of a suspension or holiday
-    # *after* an instrument enters the universe.  It is not a valid stand-in
-    # for the period before a configured asset has any history at all.  The
-    # latter would manufacture factors (and, for US names, NaN liquidity)
-    # when a longer benchmark history is enabled for backtesting.
-    availability_starts: list[str] = []
-    for code in equity_codes:
-        observed = _load_one(code, cache_dir)
-        observed = observed.loc[observed.index <= as_of]
-        if observed.empty:
-            raise ValueError(f"{code}: no history on or before {as_of}")
-        availability_starts.append(str(observed.index[0]))
-    for item in hedges:
-        if item["kind"] != "contract":
-            continue
-        symbol = _code(item)
-        if symbol not in data["contract_files"]:
-            raise ValueError(f"no contract CSV configured for {symbol}")
-        prices = _contract_prices(data["contract_files"][symbol], as_of)
-        if prices.empty:
-            raise ValueError(f"{symbol}: no prices on or before {as_of}")
-        availability_starts.append(str(prices.index[0]))
-    calendar = calendar[calendar >= max(availability_starts)]
-    calendar = calendar[-preferred:]
-    base = pd.DataFrame(index=calendar)
-    for code in mainland_codes:
-        base[code] = _load_one(code, cache_dir).reindex(calendar).fillna(0.0)
-
-    for code in us_codes:
-        us_return = _load_one(code, cache_dir)
-        us_return = us_return.loc[us_return.index <= as_of]
-        # A missing US session is a closed market (0); shift makes the
-        # prior US close the latest known observation at A-share close.
-        base[code] = us_return.reindex(calendar).fillna(0.0).shift(1)
-
-    contract_codes = [
-        _code(item) for item in hedges if item["kind"] == "contract"]
-    for symbol in contract_codes:
-        if symbol not in data["contract_files"]:
-            raise ValueError(f"no contract CSV configured for {symbol}")
-        path = data["contract_files"][symbol]
+    for symbol, path in data["contract_files"].items():
         prices = _contract_prices(path, as_of)
         # Select A-share dates at the price level first.  Monday's return
         # then includes the whole weekend rather than only one crypto day.
-        # The ffill only uses a past close and expires after five sessions.
-        aligned_prices = prices.reindex(calendar).ffill(limit=5)
-        base[symbol] = aligned_prices.pct_change(fill_method=None)
+        aligned_prices = prices.reindex(calendar)
+        base[str(symbol)] = aligned_prices.pct_change(fill_method=None)
 
     joined = base.join(
-        benchmark_return.reindex(calendar).rename("__benchmark__"), how="inner",
+        stock_and_benchmark[benchmark].rename("__benchmark__"),
+        how="inner",
     ).dropna()
     minimum = int(objective["min_common_observations"])
     if len(joined) < minimum:
         raise ValueError(
             f"only {len(joined)} common observations, need at least {minimum}")
     liquidity = _stock_liquidity(
-        equity_codes, as_of, min(preferred, len(calendar)), cache_dir)
+        codes, as_of, preferred, str(data["stock_cache_dir"]))
     return MarketInputs(
         base_returns=joined[base.columns],
         benchmark_returns=joined["__benchmark__"],
         stock_liquidity=liquidity,
         as_of=as_of,
         preferred_observations=preferred,
-        equity_codes=tuple(equity_codes),
     )
 
 
@@ -229,22 +156,15 @@ def price_factor_table(
     low_volatility = _zscore(
         -returns.std(axis=0).to_numpy() * np.sqrt(annualization))
 
-    equity_codes = list(inputs.equity_codes)
-    if not equity_codes:  # synthetic/unit-test compatibility
-        equity_codes = [_code(item) for item in config["universe"]["candidates"]]
+    stock_codes = []
+    for item in config["universe"]["candidates"]:
+        raw_code = str(item["code"])
+        stock_codes.append(
+            raw_code.zfill(6) if raw_code.isdigit() else raw_code.upper()
+        )
     liquidity = np.zeros(returns.shape[1], dtype=np.float64)
-    # Dollar/CNY turnover magnitudes are not comparable. Standardize the
-    # liquidity score separately for the mainland and US equity sleeves;
-    # contracts intentionally receive the neutral score 0.
-    for is_us in (False, True):
-        group = [code for code in equity_codes
-                 if code.startswith("us_") == is_us]
-        positions = [returns.columns.get_loc(code) for code in group
-                     if code in returns.columns]
-        values = inputs.stock_liquidity.reindex(
-            [returns.columns[i] for i in positions]).to_numpy()
-        if positions:
-            liquidity[positions] = _zscore(np.log1p(values))
+    liquidity[:len(stock_codes)] = _zscore(
+        np.log1p(inputs.stock_liquidity.reindex(stock_codes).to_numpy()))
 
     weights = config["preselection"]["factors"]
     score = (
@@ -283,60 +203,41 @@ def _market_betas(
 
 def build_real_qubo(
         inputs: MarketInputs, config: dict[str, Any],
-        previous_selection: np.ndarray | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, np.ndarray, dict[str, Any]]:
     """Create the n=24 QUBO and its auditable variable table."""
     candidates = config["universe"]["candidates"]
-    hedge_assets = _hedge_assets(config)
     factors = price_factor_table(inputs, config)
     betas = _market_betas(inputs.base_returns, inputs.benchmark_returns)
     rows: list[dict[str, Any]] = []
     source_columns: list[str] = []
 
     stock_scale = float(config["selection"]["stock_proxy_exposure"])
+    hedge_scale = float(config["selection"]["hedge_proxy_exposure"])
     for item in candidates:
-        code = _code(item)
+        code = str(item["code"]).zfill(6)
         rows.append({
             "variable": code,
             "underlying": code,
             "name": str(item["name"]),
-            "asset_type": "equity",
-            "role": "alpha",
+            "asset_type": "stock",
             "direction": "long",
             "sign": 1.0,
             "proxy_exposure": stock_scale,
         })
         source_columns.append(code)
-    conflict_pairs: list[tuple[int, int]] = []
-    for item in hedge_assets:
-        symbol = _code(item)
-        kind = str(item["kind"])
-        directions = list(item["directions"])
-        direction_to_index: dict[str, int] = {}
-        proxy_exposure = (
-            float(config["selection"]["equity_hedge_proxy_exposure"])
-            if kind == "equity" else
-            float(config["selection"]["contract_hedge_proxy_exposure"]))
-        for direction in directions:
-            if direction not in ("long", "short"):
-                raise ValueError(
-                    f"{symbol}: unsupported direction {direction!r}")
-            sign = 1.0 if direction == "long" else -1.0
-            direction_to_index[direction] = len(rows)
+    for instrument in config["hedges"]["instruments"]:
+        symbol = str(instrument).split("-", 1)[0]
+        for direction, sign in (("long", 1.0), ("short", -1.0)):
             rows.append({
                 "variable": f"{symbol}_{direction}",
                 "underlying": symbol,
-                "name": str(item["name"]),
-                "asset_type": kind,
-                "role": "hedge",
+                "name": str(instrument),
+                "asset_type": "hedge",
                 "direction": direction,
                 "sign": sign,
-                "proxy_exposure": proxy_exposure,
+                "proxy_exposure": hedge_scale,
             })
             source_columns.append(symbol)
-        if {"long", "short"} <= direction_to_index.keys():
-            conflict_pairs.append((direction_to_index["long"],
-                                   direction_to_index["short"]))
     variables = pd.DataFrame(rows)
     if len(variables) != int(config["selection"]["qubits"]):
         raise ValueError(
@@ -361,10 +262,11 @@ def build_real_qubo(
     variables["beta"] = beta
 
     costs = np.where(
-        variables["role"].to_numpy() == "alpha",
+        variables["asset_type"].to_numpy() == "stock",
         float(config["selection"]["stock_holding_cost"]),
         float(config["selection"]["hedge_direction_holding_cost"]),
     ) * variables["proxy_exposure"].to_numpy()
+    conflict_pairs = [(18, 19), (20, 21), (22, 23)]
     objective = config["objective"]
     Q = build_flexible_selection_qubo(
         alpha,
@@ -377,8 +279,6 @@ def build_real_qubo(
         lambda_downside=float(objective["downside_risk_weight"]),
         lambda_beta=float(objective["beta_penalty_weight"]),
         holding_cost=costs,
-        previous_selection=previous_selection,
-        lambda_turnover=float(objective["turnover_penalty_weight"]),
         mutually_exclusive=conflict_pairs,
         conflict_penalty=float(
             config["selection"]["direction_conflict_penalty"]),
@@ -390,69 +290,8 @@ def build_real_qubo(
         "benchmark_down_observations": int(
             (inputs.benchmark_returns < 0.0).sum()),
         "annualization": annualization,
-        "us_return_lag_a_share_sessions": 1,
-        "direction_conflict_pairs": conflict_pairs,
     }
     return Q, variables, covariance, meta
-
-
-def qubo_objective_terms(
-        selected: np.ndarray,
-        variables: pd.DataFrame,
-        covariance: np.ndarray,
-        config: dict[str, Any],
-        previous_selection: np.ndarray | None = None,
-) -> dict[str, float]:
-    """Auditable decomposition of the variable-cardinality QUBO objective."""
-    x = np.asarray(selected, dtype=np.float64)
-    if x.shape != (len(variables),) or not np.all(np.isin(x, (0.0, 1.0))):
-        raise ValueError("selected must be a binary vector matching variables")
-    objective = config["objective"]
-    signs = variables["sign"].to_numpy(dtype=np.float64)
-    proxy = variables["proxy_exposure"].to_numpy(dtype=np.float64)
-    alpha = variables["expected_annual_return_proxy"].to_numpy(dtype=np.float64)
-    beta = variables["beta"].to_numpy(dtype=np.float64)
-    v = signs * proxy * x
-    costs = np.where(
-        variables["role"].to_numpy() == "alpha",
-        float(config["selection"]["stock_holding_cost"]),
-        float(config["selection"]["hedge_direction_holding_cost"]),
-    ) * proxy
-    conflict = 0.0
-    for _, group in variables.groupby("underlying"):
-        direction = dict(zip(group["direction"], group.index, strict=True))
-        if "long" in direction and "short" in direction:
-            conflict += (float(config["selection"]["direction_conflict_penalty"])
-                         * x[direction["long"]] * x[direction["short"]])
-    risk = float(objective["downside_risk_weight"]) * float(v @ covariance @ v)
-    reward = -float(objective["expected_return_weight"]) * float(alpha @ v)
-    beta_term = (float(objective["beta_penalty_weight"])
-                 * float(beta @ v - float(objective["beta_target"])) ** 2)
-    holding = float(costs @ x)
-    turnover = 0.0
-    turnover_constant = 0.0
-    if previous_selection is not None:
-        previous = np.asarray(previous_selection, dtype=np.float64)
-        if previous.shape != x.shape or not np.all(np.isin(previous, (0.0, 1.0))):
-            raise ValueError("previous_selection must be binary and match selected")
-        turnover = (float(objective["turnover_penalty_weight"])
-                    * float(np.abs(x - previous).sum()))
-        turnover_constant = (float(objective["turnover_penalty_weight"])
-                             * float(previous.sum()))
-    constant = (float(objective["beta_penalty_weight"])
-                * float(objective["beta_target"]) ** 2)
-    return {
-        "downside_risk": risk,
-        "negative_return_reward": reward,
-        "beta_penalty": beta_term,
-        "holding_cost": holding,
-        "direction_conflict": conflict,
-        "selection_turnover": turnover,
-        "full_objective": risk + reward + beta_term + holding + turnover + conflict,
-        "qubo_energy_without_constant": (
-            risk + reward + beta_term + holding + turnover + conflict
-            - constant - turnover_constant),
-    }
 
 
 def allocate_selected_weights(
@@ -460,35 +299,13 @@ def allocate_selected_weights(
         variables: pd.DataFrame,
         covariance: np.ndarray,
         config: dict[str, Any],
-        previous_weights: np.ndarray | None = None,
-        max_turnover: float | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Continuous SLSQP allocation on the QUBO-selected subset."""
     selected = np.asarray(selected, dtype=np.int64)
-    if previous_weights is None:
-        previous = np.zeros(len(selected), dtype=np.float64)
-    else:
-        previous = np.asarray(previous_weights, dtype=np.float64)
-        if previous.shape != (len(selected),) or not np.all(np.isfinite(previous)):
-            raise ValueError("previous_weights must be finite and match selected")
-    if max_turnover is not None and max_turnover < 0.0:
-        raise ValueError("max_turnover must be non-negative")
-    # A hard trading cap means a newly selected target cannot always replace
-    # every old holding immediately.  Retain old non-selected positions as
-    # "carry" variables with a zero-to-current-weight bound; they can only
-    # be reduced, never increased.  This makes the executed portfolio a
-    # feasible path from the previous one while keeping the QUBO selection
-    # visible as the desired target set.
-    selected_active = np.flatnonzero(selected)
-    carry_active = np.flatnonzero((np.abs(previous) > 1e-12) & ~selected.astype(bool))
-    active = np.union1d(selected_active, carry_active)
+    active = np.flatnonzero(selected)
     if not len(active):
-        turnover = 0.5 * float(np.abs(previous).sum())
-        if max_turnover is not None and turnover > max_turnover + 1e-10:
-            raise RuntimeError("turnover cap makes the empty allocation infeasible")
         return np.zeros(len(selected)), {
             "gross_exposure": 0.0, "net_exposure": 0.0, "portfolio_beta": 0.0,
-            "turnover": turnover,
         }
     table = variables.iloc[active]
     signs = table["sign"].to_numpy(dtype=np.float64)
@@ -498,17 +315,12 @@ def allocate_selected_weights(
     cov = covariance[np.ix_(active, active)]
     allocation = config["allocation"]
     caps = np.where(
-        table["asset_type"].to_numpy() == "equity",
+        table["asset_type"].to_numpy() == "stock",
         float(allocation["max_stock_weight"]),
         float(allocation["max_contract_abs_weight"]),
     )
     minimum_weight = float(allocation.get("min_selected_weight", 0.0))
-    selected_mask = selected[active].astype(bool)
-    bounds = [
-        ((minimum_weight if is_selected else 0.0),
-         float(cap if is_selected else min(cap, abs(previous[index]))))
-        for index, cap, is_selected in zip(active, caps, selected_mask, strict=True)
-    ]
+    bounds = [(minimum_weight, float(cap)) for cap in caps]
 
     lower_net = float(allocation["min_net_exposure"])
     upper_net = float(allocation["max_net_exposure"])
@@ -531,15 +343,6 @@ def allocate_selected_weights(
         {"type": "ineq", "fun": lambda w: upper_net - signs @ w},
         {"type": "ineq", "fun": lambda w: max_gross - w.sum()},
     ]
-    inactive_previous_abs = float(np.abs(previous[np.setdiff1d(
-        np.arange(len(selected)), active)]).sum())
-    if max_turnover is not None:
-        def turnover_slack(magnitudes: np.ndarray) -> float:
-            signed = signs * magnitudes
-            active_turnover = np.abs(signed - previous[active]).sum()
-            return float(max_turnover - 0.5 * (active_turnover + inactive_previous_abs))
-
-        constraints.append({"type": "ineq", "fun": turnover_slack})
     initial = np.minimum(caps, np.where(signs > 0.0, 0.06, 0.02))
     result = minimize(
         loss,
@@ -553,27 +356,21 @@ def allocate_selected_weights(
         raise RuntimeError(f"continuous allocation failed: {result.message}")
     weights = np.zeros(len(selected), dtype=np.float64)
     weights[active] = signs * result.x
-    turnover = 0.5 * float(np.abs(weights - previous).sum())
     diagnostics = {
         "gross_exposure": float(np.abs(weights).sum()),
         "net_exposure": float(weights.sum()),
         "portfolio_beta": float(beta @ result.x),
         "objective": float(result.fun),
-        "turnover": turnover,
     }
     return weights, diagnostics
 
 
 def solve_real_portfolio(
         config: dict[str, Any],
-        previous_selection: np.ndarray | None = None,
-        previous_weights: np.ndarray | None = None,
-        enforce_turnover_cap: bool = False,
 ) -> dict[str, Any]:
     """Run the deterministic SA baseline and continuous allocation."""
     inputs = load_market_inputs(config)
-    Q, variables, covariance, meta = build_real_qubo(
-        inputs, config, previous_selection=previous_selection)
+    Q, variables, covariance, meta = build_real_qubo(inputs, config)
     qaoa_config = config["qaoa"]
     selected, energy = solve_sa(
         Q,
@@ -582,16 +379,11 @@ def solve_real_portfolio(
         n_restarts=8,
     )
     weights, allocation = allocate_selected_weights(
-        selected, variables, covariance, config,
-        previous_weights=previous_weights,
-        max_turnover=(float(config["rebalance"]["max_turnover_per_rebalance"])
-                      if enforce_turnover_cap else None))
+        selected, variables, covariance, config)
     h, J, offset = qubo_to_ising(Q)
     output = variables.copy()
     output["selected"] = selected.astype(bool)
     output["weight"] = weights
-    output["carried"] = (~output["selected"]
-                         & (np.abs(output["weight"]) > 1e-12))
     return {
         "inputs": inputs,
         "Q": Q,
@@ -602,7 +394,4 @@ def solve_real_portfolio(
         "variables": output,
         "meta": meta,
         "allocation": allocation,
-        "objective_terms": qubo_objective_terms(
-            selected, variables, covariance, config,
-            previous_selection=previous_selection),
     }

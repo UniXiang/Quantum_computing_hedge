@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 
-from ising_qaoa import normalize_ising
 from real_portfolio import load_config, solve_real_portfolio
 
 
@@ -19,7 +18,6 @@ def _serializable(result: dict) -> dict:
         "qubo_energy": result["qubo_energy"],
         "meta": result["meta"],
         "allocation": result["allocation"],
-        "qubo_objective_terms": result["objective_terms"],
         "selected": [
             {
                 "variable": row["variable"],
@@ -48,9 +46,6 @@ def main() -> None:
         "--config", default="configs/portfolio_default.yaml")
     parser.add_argument(
         "--output", default="results/real_portfolio_2026-07-03.json")
-    parser.add_argument(
-        "--instance-output", type=Path,
-        help="Optional NPZ export for the GPU-only QAOA host.")
     args = parser.parse_args()
     result = solve_real_portfolio(load_config(args.config))
     payload = _serializable(result)
@@ -60,17 +55,6 @@ def main() -> None:
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    if args.instance_output:
-        method = load_config(args.config)["qaoa"]["hamiltonian_normalization"]
-        scaled_h, scaled_J, scale = normalize_ising(
-            result["h"], result["J"], method=method)
-        args.instance_output.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            args.instance_output,
-            h=result["h"], J=result["J"], offset=result["ising_offset"],
-            scaled_h=scaled_h, scaled_J=scaled_J,
-            hamiltonian_scale=np.array(scale),
-        )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"\nSaved: {path}")
 

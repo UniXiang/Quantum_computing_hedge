@@ -1,0 +1,86 @@
+universe:
+  source: nasdaq_parquet
+  market_daily_file: data/market_daily.parquet
+  stock_pool_size: 500
+  finalists: 9
+  min_history_observations: 120
+  liquidity_window: 20
+  min_average_dollar_volume: 10000000
+  company_names:
+    SNDK: Sandisk Corporation
+    INTC: Intel Corporation
+    MU: Micron Technology, Inc.
+    DFTX: Definium Therapeutics, Inc.
+    MRNA: Moderna, Inc.
+    TWST: Twist Bioscience Corporation
+    IRDM: Iridium Communications Inc.
+    CSCO: Cisco Systems, Inc.
+    CSX: CSX Corporation
+
+data:
+  as_of: "2026-07-03"
+  benchmark_method: eligible_equal_weight
+  contract_files:
+    BTC: data/crypto_daily/BTC_USDT_1d.csv
+    CL: data/crypto_daily/CL_USDT_1d.csv
+    XAU: data/crypto_daily/XAU_USDT_1d.csv
+
+preselection:
+  factors:
+    momentum: 0.30
+    downside_adjusted_return: 0.30
+    low_volatility: 0.20
+    liquidity: 0.20
+  momentum_windows: [20, 60, 120]
+  max_per_sector: 3
+
+hedges:
+  instruments:
+    - BTC-USDT-SWAP
+    - CL-USDT-SWAP
+    - XAU-USDT
+  directions: [long, short]
+  mutually_exclusive_directions: true
+
+selection:
+  qubits: 24
+  stock_underlyings: 9
+  alternative_underlyings: 3
+  directions_per_underlying: 2
+  stock_proxy_exposure: 0.05
+  hedge_proxy_exposure: 0.08
+  stock_direction_holding_cost: 0.01
+  hedge_direction_holding_cost: 0.01
+  direction_conflict_penalty: 2.0
+
+objective:
+  expected_return_weight: 1.0
+  downside_risk_weight: 2.0
+  beta_target: 0.60
+  beta_penalty_weight: 1.0
+  annualization: 252
+  preferred_window: 120
+  min_common_observations: 60
+  min_benchmark_down_observations: 20
+  signal_annual_return_scale: 0.15
+
+qaoa:
+  layers: 1
+  dtype: complex64
+  adjoint: true
+  checkpoint: true
+  top_k: 4096
+  fallback_solver: simulated_annealing
+  sa_budget_seconds: 5.0
+  seed: 42
+
+allocation:
+  method: continuous_convex
+  long_short: true
+  target_beta: 0.60
+  max_stock_weight: 0.08
+  max_contract_abs_weight: 0.12
+  max_gross_exposure: 1.30
+  min_net_exposure: 0.40
+  max_net_exposure: 1.00
+  min_selected_weight: 0.005
